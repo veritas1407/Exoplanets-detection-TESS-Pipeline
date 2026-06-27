@@ -1,0 +1,26 @@
+# Core transit-photometry stack (pinned to avoid the NumPy-2 ABI conflict with
+# transitleastsquares / batman, which are compiled against NumPy < 2).
+numpy<2
+astropy<7
+lightkurve
+transitleastsquares
+wotan
+batman-package
+emcee
+corner
+scipy
+
+# Classifier
+lightgbm
+scikit-learn
+imbalanced-learn
+pandas
+pyarrow
+joblib
+
+# Data access
+astroquery
+
+# App
+streamlit
+matplotlib
