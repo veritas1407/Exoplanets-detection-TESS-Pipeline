@@ -154,6 +154,149 @@ def clean(star: Star) -> Star:
     )
 
 
+# --------------------------------------------------------------------------------------
+# Bulk-sector ingest — the dataset PS7 actually asks for
+# --------------------------------------------------------------------------------------
+def sector_lc_manifest(sector: int | None = None, limit: int | None = None,
+                       force: bool = False):
+    """Fetch + parse a sector's 2-min LC bulk-download script into a manifest.
+
+    Downloads ``tesscurl_sector_{sector}_lc.sh`` from MAST and parses each ``curl`` line
+    into ``{tic, url, lc_file, sector}`` — *without* downloading any FITS yet. The parsed
+    manifest is cached to ``data/labels/sector_{sector}_manifest.parquet``.
+
+    Returns a pandas DataFrame (one row per target).
+    """
+    import re
+    import pandas as pd
+
+    sector = int(sector if sector is not None else config.DEFAULT_SECTOR)
+    cache = config.LABELS_DIR / f"sector_{sector}_manifest.parquet"
+    if cache.exists() and not force:
+        df = pd.read_parquet(cache)
+        return df.head(limit) if limit else df
+
+    url = config.BULK_SCRIPT_URL.format(sector=sector)
+    text = _http_get_text(url)
+    rows = []
+    # Each data line: curl -C - -L -o <lc_file>.fits <download_url>
+    # The 16-digit zero-padded TIC id is the middle field of the SPOC filename:
+    #   tess<obsdate>-s00NN-0000000307210830-0125-s_lc.fits
+    line_re = re.compile(r"-o\s+(\S+\.fits)\s+(\S+)")
+    tic_re = re.compile(r"-s\d{4}-0*(\d+)-")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("curl"):
+            continue
+        m = line_re.search(line)
+        if not m:
+            continue
+        lc_file, dl_url = m.group(1), m.group(2)
+        tm = tic_re.search(lc_file)
+        if not tm:
+            continue
+        rows.append({"tic": f"TIC {int(tm.group(1))}", "tid": int(tm.group(1)),
+                     "lc_file": lc_file, "url": dl_url, "sector": sector})
+
+    df = pd.DataFrame(rows).drop_duplicates(subset="tid").reset_index(drop=True)
+    df.to_parquet(cache, index=False)
+    return df.head(limit) if limit else df
+
+
+def _http_get_text(url: str) -> str:
+    """GET a text resource with a small retry loop (MAST occasionally drops connections)."""
+    import time as _t
+    import urllib.request
+
+    last_err = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "exopipeline/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            last_err = e
+            _t.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"Failed to fetch {url!r} after retries: {last_err}")
+
+
+def _star_from_lightcurve(lc, target: str) -> Star:
+    """Build a cleaned :class:`Star` from a single lightkurve LightCurve (one sector)."""
+    lc = lc.remove_nans()
+    time = np.ascontiguousarray(lc.time.value, dtype="float64")
+    flux = np.ascontiguousarray(lc.flux.value, dtype="float64")
+    try:
+        flux_err = np.ascontiguousarray(lc.flux_err.value, dtype="float64")
+    except Exception:
+        flux_err = np.full_like(flux, np.nan)
+    # normalise to ~1.0 so detrend/search thresholds match the stitched path
+    med = np.nanmedian(flux)
+    if np.isfinite(med) and med != 0:
+        flux = flux / med
+        flux_err = flux_err / med
+    meta = getattr(lc, "meta", {}) or {}
+    crowdsap = float(meta.get("CROWDSAP", np.nan))
+    flfrcsap = float(meta.get("FLFRCSAP", np.nan))
+    sector = meta.get("SECTOR")
+    return Star(target=target, time=time, flux=flux, flux_err=flux_err,
+                crowdsap=crowdsap, flfrcsap=flfrcsap, n_sectors=1,
+                sectors=[int(sector)] if sector is not None else [], raw_lc=lc,
+                pre_flattened=False)
+
+
+def load_lc_from_file(path, target: str | None = None) -> Star:
+    """Read one SPOC 2-min LC FITS already on disk into a :class:`Star` (PDCSAP_FLUX)."""
+    import lightkurve as lk
+
+    lc = lk.read(str(path))            # SPOC LC -> defaults to PDCSAP_FLUX
+    tic = target
+    if tic is None:
+        tic = f"TIC {lc.meta.get('TICID')}" if lc.meta.get("TICID") else str(path)
+    return _star_from_lightcurve(lc, tic)
+
+
+def load_lc_from_url(url: str, lc_file: str | None = None,
+                     target: str | None = None, keep_fits: bool = True) -> Star:
+    """Download one SPOC 2-min LC FITS from a MAST file URL and load it as a :class:`Star`.
+
+    Caches the FITS under ``data/cache/``. If ``keep_fits`` is False the file is deleted
+    after loading (streaming mode to cap disk footprint on a full-sector run).
+    """
+    import re
+    import time as _t
+    import urllib.request
+
+    if lc_file is None:
+        m = re.search(r"([^/=:]+\.fits)", url)
+        lc_file = m.group(1) if m else "lc.fits"
+    dest = config.CACHE_DIR / lc_file
+
+    if not dest.exists():
+        last_err = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "exopipeline/1.0"})
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = resp.read()
+                dest.write_bytes(data)
+                break
+            except Exception as e:
+                last_err = e
+                _t.sleep(5 * (attempt + 1))
+        else:
+            raise RuntimeError(f"Download failed for {url!r}: {last_err}")
+
+    try:
+        star = load_lc_from_file(dest, target=target)
+    finally:
+        if not keep_fits and dest.exists():
+            try:
+                dest.unlink()
+            except Exception:
+                pass
+    return star
+
+
 def load_tpf(target: str, sector: int | None = None):
     """Fetch a SPOC 2-min Target Pixel File for the difference-imaging blend test.
 

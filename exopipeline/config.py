@@ -23,6 +23,23 @@ FEATURE_TABLE = FEATURES_DIR / "features.parquet"
 MODEL_PATH = FEATURES_DIR / "classifier.joblib"
 
 # --------------------------------------------------------------------------------------
+# Bulk-sector ingest (the dataset PS7 actually asks for: a sector's 2-min light curves)
+# --------------------------------------------------------------------------------------
+# Per-sector MAST bulk-download shell script of 2-min SPOC light-curve cURL commands.
+# NOTE: the PS link archive.stsci.edu/tess/tic_ctl.html is the *star catalog* (metadata,
+# no photometry) — NOT the light curves. The light curves live in these per-sector scripts.
+BULK_SCRIPT_URL = ("https://archive.stsci.edu/missions/tess/download_scripts/"
+                   "sector/tesscurl_sector_{sector}_lc.sh")
+# A single FITS is fetched per target from this file-download API (parsed out of the script):
+#   https://mast.stsci.edu/api/v0.1/Download/file/?uri=mast:TESS/product/<lc_file>.fits
+DEFAULT_SECTOR = 5                # contains TOI 700 (TIC 307210830) + TOI-270 (TIC 259377017)
+SECTOR_CANDIDATES = [5, 4, 3]     # southern sectors with the anchor targets (auto-pick order)
+SLICE_SIZE = 4000                 # representative unbiased slice (first N of ~20k); None = full
+SCAN_CHECKPOINT_EVERY = 25        # rows between candidate-CSV checkpoints
+SECTOR_CANDIDATES_CSV = FEATURES_DIR / "sector_{sector}_candidates.csv"
+SECTOR_MANIFEST = LABELS_DIR / "sector_{sector}_manifest.parquet"
+
+# --------------------------------------------------------------------------------------
 # Detection thresholds
 # --------------------------------------------------------------------------------------
 SDE_THRESHOLD = 9.0       # TLS signal-detection-efficiency floor for a real signal
