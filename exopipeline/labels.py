@@ -29,9 +29,21 @@ DISP_MAP = {
     "FA": "other",
 }
 
+# Clean mapping (preferred): only *confirmed* planets are "transit"; EB labels come from the
+# dedicated TESS EB catalog (not FP, which is a noisy grab-bag of blends/systematics);
+# FA (false alarm) -> "other". This makes the classes physically separable in transit-shape
+# space, which the noisy FP->EB mapping does not (transit and FP overlap almost completely).
+CLEAN_DISP_MAP = {
+    "CP": "transit", "KP": "transit",     # confirmed / known planets only
+    "FA": "other",                        # false alarms / noise / systematics
+}
+
+# Prsa et al. 2022, "TESS Eclipsing Binary Stars. I." (ApJS 258, 16) via VizieR.
+TESS_EB_VIZIER = "J/ApJS/258/16"
+
 
 def fetch_toi(force=False) -> pd.DataFrame:
-    """Download (and cache) the TOI catalog with mapped labels."""
+    """Download (and cache) the TOI catalog with mapped labels (noisy FP->EB mapping)."""
     path = config.LABELS_DIR / "toi_catalog.csv"
     if path.exists() and not force:
         return pd.read_csv(path)
@@ -41,6 +53,50 @@ def fetch_toi(force=False) -> pd.DataFrame:
     df["tic"] = "TIC " + df["tid"].astype(int).astype(str)
     df.to_csv(path, index=False)
     return df
+
+
+def fetch_tess_eb(force=False) -> pd.DataFrame:
+    """Download (and cache) the Prsa+ 2022 TESS Eclipsing Binary catalog as clean EB labels.
+
+    Returns a DataFrame with columns ``tic, tid, pl_orbper, st_tmag, label`` where
+    ``label == 'eclipsing_binary'``.
+    """
+    path = config.LABELS_DIR / "tess_eb_catalog.csv"
+    if path.exists() and not force:
+        return pd.read_csv(path)
+    from astroquery.vizier import Vizier
+    v = Vizier(columns=["TIC", "Per", "Tmag", "Morph"])
+    v.ROW_LIMIT = -1
+    tbl = v.get_catalogs(TESS_EB_VIZIER)[0].to_pandas()
+    tbl = tbl.rename(columns={"TIC": "tid", "Per": "pl_orbper", "Tmag": "st_tmag"})
+    tbl = tbl.dropna(subset=["tid", "pl_orbper"])
+    tbl["tid"] = tbl["tid"].astype(int)
+    tbl["tic"] = "TIC " + tbl["tid"].astype(str)
+    tbl["label"] = "eclipsing_binary"
+    tbl = tbl[(tbl["pl_orbper"] > 0)].drop_duplicates("tid")
+    tbl.to_csv(path, index=False)
+    return tbl
+
+
+def fetch_toi_clean(force=False) -> pd.DataFrame:
+    """TOI catalog with the *clean* mapping (CP/KP -> transit, FA -> other; FP dropped)."""
+    df = fetch_toi(force=force).copy()
+    df["label"] = df["tfopwg_disp"].map(CLEAN_DISP_MAP)
+    return df.dropna(subset=["label", "tid", "pl_orbper"])
+
+
+def build_clean_sample(per_class=80, tmag_max=12.5, seed=42) -> pd.DataFrame:
+    """Class-balanced sample with CLEAN labels: confirmed planets (transit), real EBs from
+    the TESS EB catalog (eclipsing_binary), and TOI false alarms (other).
+
+    Columns: tic, tid, label, pl_orbper, st_tmag.
+    """
+    cols = ["tic", "tid", "label", "pl_orbper", "st_tmag"]
+    toi = fetch_toi_clean()
+    eb = fetch_tess_eb()
+    pool = pd.concat([toi[toi["label"].isin(["transit", "other"])][cols], eb[cols]],
+                     ignore_index=True)
+    return balanced_sample(pool, per_class=per_class, tmag_max=tmag_max, seed=seed)
 
 
 def balanced_sample(df: pd.DataFrame, per_class=60, tmag_max=12.5,

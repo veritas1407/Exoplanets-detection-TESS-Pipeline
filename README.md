@@ -119,10 +119,30 @@ which avoids this entirely; enable `refine=True` on Colab for a TLS cross-check.
 | **TOI-270 blind multi-planet** (6 sectors) | **c @ 5.66 d & d @ 11.38 d are the top-2 SDE candidates**; 2:1 resonance kept, exact aliases rejected |
 | **TOI 700 d** focused fit (27 sectors) | **P = 37.434 d, Rp = 1.14 (+0.25/−0.09) R⊕, depth = 620 ppm** — matches literature (37.426 d, 1.14 R⊕, ~530 ppm) |
 | TOI 700 blind search | Surfaces a dominant ~3.69 d instrumental systematic (SDE ≈ 128) — an honest hard case the vetting flags |
+| **Sector 5 blind scan** (4,157 stars) | 570 periodic events detected in 66 min (multiprocess BLS); 200 known TOIs included as validation |
 
 Notes: TOI 700 d is shallow (~530 ppm); the *full* sector baseline is needed to pin the
 geometry (a 14-sector subset leaves the fit grazing-degenerate). The fit uses a stellar-
 density prior on a/R\* and reports MCMC posterior credible intervals.
+
+### Classifier accuracy + the label-quality ablation (O4)
+Held-out (30%) macro metrics, **leak-free** (both tracks trained on the same train split,
+evaluated on unseen data). The headline finding is that **label quality, not the model, was
+the ceiling**: the noisy `FP → eclipsing_binary` mapping makes the transit and EB classes
+nearly inseparable in transit-shape space (a strong secondary eclipse was split ~50/50
+between them). Swapping in the dedicated **TESS EB catalog** (Prša+ 2022) for real EB labels
+and restricting the transit class to **confirmed planets (CP/KP)** lifts every model:
+
+| Model | Noisy labels (`FP→EB`) | **Clean labels (TESS-EB + CP/KP)** |
+|---|---|---|
+| Tabular LightGBM (Track A) | 0.60 | **0.76** |
+| Dual-view CNN (Track B) | 0.54 | **0.74** |
+| **Late-fusion ensemble** | 0.59 | **0.79** |
+
+With clean labels the ensemble beats both single tracks (as the literature expects), because
+the CNN (folded shape) and LightGBM (engineered vetting features) become complementary. A
+learning-curve check confirmed the cause: under noisy labels, *doubling* the training data did
+not help — the cap was label noise, not data quantity. See `labels.build_clean_sample`.
 
 ## Data — what to download (and what *not* to)
 The PS links `archive.stsci.edu/tess/tic_ctl.html`. **That page is the TIC/CTL star
