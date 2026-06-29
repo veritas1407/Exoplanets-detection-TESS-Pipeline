@@ -36,6 +36,12 @@ DEFAULT_SECTOR = 5                # contains TOI 700 (TIC 307210830) + TOI-270 (
 SECTOR_CANDIDATES = [5, 4, 3]     # southern sectors with the anchor targets (auto-pick order)
 SLICE_SIZE = 4000                 # representative unbiased slice (first N of ~20k); None = full
 SCAN_CHECKPOINT_EVERY = 25        # rows between candidate-CSV checkpoints
+# Single-sector scans only span ~27 d, so a period > baseline/2 has <2 transits and is
+# undetectable. Cap the blind BLS grid accordingly to keep the per-target search fast.
+SCAN_PERIOD_MAX_FRAC = 0.5        # period_max = this * light-curve baseline (days)
+SCAN_PERIOD_MAX_CAP = 13.0        # never search longer than this in a single-sector scan
+SCAN_N_PERIODS = 12000            # BLS grid points for the (smaller) single-sector range
+SCAN_WORKERS = 0                  # 0 = use (cpu_count - 1) processes; >=1 sets it explicitly
 SECTOR_CANDIDATES_CSV = FEATURES_DIR / "sector_{sector}_candidates.csv"
 SECTOR_MANIFEST = LABELS_DIR / "sector_{sector}_manifest.parquet"
 

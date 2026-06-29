@@ -150,7 +150,7 @@ def _is_duplicate(period, found_periods, rtol=0.01, harm_rtol=0.004):
 
 
 def find_planets(time, flux, max_planets=None, refine=False, verbose=True,
-                 sde_threshold=None):
+                 sde_threshold=None, period_min=None, period_max=None, n_periods=None):
     """Blind multi-planet search via BLS broad sweep + iterative masking.
 
     Each iteration takes the strongest BLS peak; if it duplicates an already-found period
@@ -185,7 +185,10 @@ def find_planets(time, flux, max_planets=None, refine=False, verbose=True,
     time = np.ascontiguousarray(time, dtype="float64")
     work = np.ascontiguousarray(flux, dtype="float64")
 
-    period_grid = np.linspace(config.PERIOD_MIN, config.PERIOD_MAX, config.N_PERIODS)
+    pmin = period_min if period_min is not None else config.PERIOD_MIN
+    pmax = period_max if period_max is not None else config.PERIOD_MAX
+    npg = n_periods if n_periods is not None else config.N_PERIODS
+    period_grid = np.linspace(pmin, pmax, npg)
     candidates: list[Candidate] = []
     found_periods: list[float] = []
 

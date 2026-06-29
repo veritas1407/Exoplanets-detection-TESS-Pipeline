@@ -113,8 +113,13 @@ def scan_target(row: dict, keep_fits: bool = True, model=None) -> dict:
             return res
 
         flat = detrend.detrend(star.time, star.flux)
+        # Single-sector baseline: cap the BLS period range (a period > baseline/2 has
+        # <2 transits) and use a smaller grid -> much faster per-target search.
+        baseline = float(flat.time.max() - flat.time.min())
+        pmax = min(config.SCAN_PERIOD_MAX_CAP, max(2.0, baseline * config.SCAN_PERIOD_MAX_FRAC))
         cands = search.find_planets(flat.time, flat.flux, max_planets=1,
-                                    refine=False, verbose=False)
+                                    refine=False, verbose=False,
+                                    period_max=pmax, n_periods=config.SCAN_N_PERIODS)
         if not cands:
             res["status"] = "no_detection"
             return res
@@ -138,11 +143,33 @@ def scan_target(row: dict, keep_fits: bool = True, model=None) -> dict:
         return res
 
 
+# Per-process globals (set by the pool initializer) so the classifier model is loaded
+# once per worker instead of pickled with every task.
+_WORKER_MODEL = None
+_WORKER_KEEP_FITS = True
+
+
+def _init_worker(keep_fits: bool):
+    import warnings as _w
+    _w.filterwarnings("ignore")
+    global _WORKER_MODEL, _WORKER_KEEP_FITS
+    _WORKER_MODEL = classify.load_model()
+    _WORKER_KEEP_FITS = keep_fits
+
+
+def _scan_one(row: dict) -> dict:
+    """Module-level worker (picklable for ProcessPoolExecutor spawn on Windows)."""
+    return scan_target(row, keep_fits=_WORKER_KEEP_FITS, model=_WORKER_MODEL)
+
+
 def scan_slice(sector: int | None = None, n: int | None = None,
                out_csv=None, keep_fits: bool = True, resume: bool = True,
-               model=None, limit: int | None = None, n_workers: int = 8,
-               verbose: bool = True) -> pd.DataFrame:
+               model=None, limit: int | None = None, n_workers: int | None = None,
+               use_processes: bool = True, verbose: bool = True) -> pd.DataFrame:
     """Scan a sector slice (Tier 1), checkpointing to CSV. Resumable & parallel.
+
+    The per-target cost is dominated by the **CPU-bound BLS search**, so the default uses a
+    **process** pool (true multi-core parallelism); threads would serialize under the GIL.
 
     Parameters
     ----------
@@ -155,20 +182,28 @@ def scan_slice(sector: int | None = None, n: int | None = None,
     resume : bool
         Skip TICs already present in ``out_csv``.
     model : optional
-        Pre-loaded classifier (loaded once here if ``None`` and a model exists on disk),
-        so the per-target loop does not re-read it from disk.
+        Pre-loaded classifier; in process mode each worker loads it once via the initializer.
     limit : int, optional
         Hard cap on number of targets processed this call (handy for smoke tests).
-    n_workers : int
-        Thread-pool size. Downloads are I/O-bound, so threads give a large speedup;
-        set 1 for a sequential run.
+    n_workers : int, optional
+        Worker count (default ``config.SCAN_WORKERS``; 0 -> cpu_count - 1).
+    use_processes : bool
+        True (default) -> ProcessPoolExecutor (parallel BLS across cores).
+        False -> sequential (simplest; for debugging or tiny runs).
+
+    NOTE: with ``use_processes=True`` the caller must be guarded by
+    ``if __name__ == "__main__":`` (Windows spawn re-imports the entry module).
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import os
+    from concurrent.futures import ProcessPoolExecutor
 
     sector = int(sector if sector is not None else config.DEFAULT_SECTOR)
     out_csv = out_csv or (config.FEATURES_DIR / f"sector_{sector}_candidates.csv")
-    if model is None:
-        model = classify.load_model()      # load once (may be None -> heuristic fallback)
+
+    if n_workers is None:
+        n_workers = config.SCAN_WORKERS
+    if not n_workers:
+        n_workers = max(1, (os.cpu_count() or 2) - 1)
 
     targets = build_slice(sector, n=n)
     done = set()
@@ -187,39 +222,38 @@ def scan_slice(sector: int | None = None, n: int | None = None,
     rows = [r.to_dict() for _, r in todo.iterrows()]
 
     if verbose:
+        mode = f"{n_workers} processes" if use_processes else "sequential"
         print(f"[scan] sector {sector}: {len(targets)} in slice, "
-              f"{len(rows)} to process this run, {n_workers} workers")
+              f"{len(rows)} to process this run ({mode})")
 
     results, t_start, ck = [], _time.time(), config.SCAN_CHECKPOINT_EVERY
     done_count = 0
 
-    def _work(row):
-        return scan_target(row, keep_fits=keep_fits, model=model)
-
-    if n_workers <= 1:
-        iterator = (_work(r) for r in rows)
-    else:
-        pool = ThreadPoolExecutor(max_workers=n_workers)
-        futures = [pool.submit(_work, r) for r in rows]
-        iterator = (f.result() for f in as_completed(futures))
-
-    try:
-        for res in iterator:
-            results.append(res)
-            done_count += 1
-            if verbose and (done_count % 10 == 0 or done_count == len(rows)):
-                rate = done_count / max(_time.time() - t_start, 1e-9)
-                eta = (len(rows) - done_count) / max(rate, 1e-9)
-                print(f"  {done_count}/{len(rows)}  ({rate:.2f}/s, ETA {eta/60:.0f} min)  "
-                      f"last={res.get('status')}")
-            if done_count % ck == 0:
-                _checkpoint(results, out_csv)
-    finally:
-        if n_workers > 1:
-            pool.shutdown(wait=True)
-        if results:
+    def _consume(res):
+        nonlocal done_count
+        results.append(res)
+        done_count += 1
+        if verbose and (done_count % 10 == 0 or done_count == len(rows)):
+            rate = done_count / max(_time.time() - t_start, 1e-9)
+            eta = (len(rows) - done_count) / max(rate, 1e-9)
+            print(f"  {done_count}/{len(rows)}  ({rate:.2f}/s, ETA {eta/60:.0f} min)  "
+                  f"last={res.get('status')}")
+        if done_count % ck == 0:
             _checkpoint(results, out_csv)
 
+    if not use_processes or n_workers <= 1:
+        if model is None:
+            model = classify.load_model()
+        for row in rows:
+            _consume(scan_target(row, keep_fits=keep_fits, model=model))
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker,
+                                 initargs=(keep_fits,)) as pool:
+            for res in pool.map(_scan_one, rows, chunksize=4):
+                _consume(res)
+
+    if results:
+        _checkpoint(results, out_csv)
     return pd.read_csv(out_csv) if out_csv.exists() else pd.DataFrame(results)
 
 
