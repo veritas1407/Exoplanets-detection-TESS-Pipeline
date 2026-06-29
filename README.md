@@ -15,6 +15,7 @@ planet parameters with honest posterior uncertainties.
 | `search.py` | 3 | **Blind** BLS broad sweep + **iterative masking** → recovers every planet; SDE/FAP significance |
 | `vetting.py` | 4 | Physics features: odd-even, secondary eclipse, U-vs-V shape, transit count, per-transit SNR |
 | `classify.py` | 5 | Calibrated LightGBM (isotonic) → class + confidence; confusion matrix / PR-AUC |
+| `cnn.py` | 5B | Dual-view 1D-CNN (Astronet-style global+local phase-fold) + **late-fusion ensemble** with the LightGBM |
 | `blend.py` | 6 | Difference-image centroid test + CROWDSAP dilution correction |
 | `fit.py` | 7 | batman + scipy seed + emcee → parameters with 16/84th-pct credible intervals |
 | `report.py` | 8 | The one-page vetting sheet |
@@ -45,7 +46,10 @@ not change per-target accuracy — it only changes how many stars are surveyed.
   instrumental systematic (SDE ≈ 128, robust to all detrending), so they cannot be blindly
   recovered from raw 2-min BLS. We characterise TOI 700 d with a *focused* search (standard
   practice for a known planet) and surface the systematic honestly rather than hiding it.
-- **Real classifier + calibrated confidence** — not a hardcoded label.
+- **Two classifier tracks + ensemble** — a calibrated LightGBM on engineered vetting
+  features (Track A) *and* a dual-view 1D-CNN that reads the phase-folded shape directly
+  (Track B, Astronet/Yu+2019 style), late-fused by averaging probabilities — not a hardcoded
+  label.
 - **Difference-imaging blend module** — the rubric's least-served requirement.
 - **Honest uncertainties** — MCMC posteriors, not point estimates.
 - **Injection-recovery** — quantifies the detection sensitivity floor (which planets are
@@ -93,7 +97,10 @@ known planet, an EB, and a blend.
 - `demo_planet_eb_blend.ipynb` — the full story: **Part A** blind multi-planet discovery
   (TOI-270), **Part B** focused characterisation of TOI 700 d + vetting sheet, **Part C**
   the honest TOI 700 systematic.
-- `classifier_training.ipynb` — build feature table, train + calibrate, confusion matrix.
+- `classifier_training.ipynb` — Track A: build feature table, train + calibrate LightGBM,
+  confusion matrix.
+- `cnn_training.ipynb` — Track B: build the dual-view phase-fold dataset, train the 1D-CNN,
+  and late-fuse it with the LightGBM (`cnn.predict_ensemble`).
 - `injection_recovery.ipynb` — the completeness curve.
 
 ### Running on Colab

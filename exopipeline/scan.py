@@ -140,8 +140,9 @@ def scan_target(row: dict, keep_fits: bool = True, model=None) -> dict:
 
 def scan_slice(sector: int | None = None, n: int | None = None,
                out_csv=None, keep_fits: bool = True, resume: bool = True,
-               model=None, limit: int | None = None, verbose: bool = True) -> pd.DataFrame:
-    """Scan a sector slice (Tier 1), checkpointing to CSV. Resumable.
+               model=None, limit: int | None = None, n_workers: int = 8,
+               verbose: bool = True) -> pd.DataFrame:
+    """Scan a sector slice (Tier 1), checkpointing to CSV. Resumable & parallel.
 
     Parameters
     ----------
@@ -153,11 +154,21 @@ def scan_slice(sector: int | None = None, n: int | None = None,
         Keep downloaded FITS in ``data/cache`` (False = streaming, deletes after load).
     resume : bool
         Skip TICs already present in ``out_csv``.
+    model : optional
+        Pre-loaded classifier (loaded once here if ``None`` and a model exists on disk),
+        so the per-target loop does not re-read it from disk.
     limit : int, optional
         Hard cap on number of targets processed this call (handy for smoke tests).
+    n_workers : int
+        Thread-pool size. Downloads are I/O-bound, so threads give a large speedup;
+        set 1 for a sequential run.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     sector = int(sector if sector is not None else config.DEFAULT_SECTOR)
     out_csv = out_csv or (config.FEATURES_DIR / f"sector_{sector}_candidates.csv")
+    if model is None:
+        model = classify.load_model()      # load once (may be None -> heuristic fallback)
 
     targets = build_slice(sector, n=n)
     done = set()
@@ -173,23 +184,41 @@ def scan_slice(sector: int | None = None, n: int | None = None,
     todo = targets[~targets["tid"].isin(done)]
     if limit:
         todo = todo.head(limit)
+    rows = [r.to_dict() for _, r in todo.iterrows()]
 
     if verbose:
         print(f"[scan] sector {sector}: {len(targets)} in slice, "
-              f"{len(todo)} to process this run")
+              f"{len(rows)} to process this run, {n_workers} workers")
 
     results, t_start, ck = [], _time.time(), config.SCAN_CHECKPOINT_EVERY
-    for i, (_, row) in enumerate(todo.iterrows(), 1):
-        res = scan_target(row.to_dict(), keep_fits=keep_fits, model=model)
-        if res is not None:
+    done_count = 0
+
+    def _work(row):
+        return scan_target(row, keep_fits=keep_fits, model=model)
+
+    if n_workers <= 1:
+        iterator = (_work(r) for r in rows)
+    else:
+        pool = ThreadPoolExecutor(max_workers=n_workers)
+        futures = [pool.submit(_work, r) for r in rows]
+        iterator = (f.result() for f in as_completed(futures))
+
+    try:
+        for res in iterator:
             results.append(res)
-        if verbose and (i % 10 == 0 or i == len(todo)):
-            rate = i / max(_time.time() - t_start, 1e-9)
-            print(f"  {i}/{len(todo)}  ({rate:.2f} targets/s)  last={res.get('status')}")
-        if results and (i % ck == 0):
+            done_count += 1
+            if verbose and (done_count % 10 == 0 or done_count == len(rows)):
+                rate = done_count / max(_time.time() - t_start, 1e-9)
+                eta = (len(rows) - done_count) / max(rate, 1e-9)
+                print(f"  {done_count}/{len(rows)}  ({rate:.2f}/s, ETA {eta/60:.0f} min)  "
+                      f"last={res.get('status')}")
+            if done_count % ck == 0:
+                _checkpoint(results, out_csv)
+    finally:
+        if n_workers > 1:
+            pool.shutdown(wait=True)
+        if results:
             _checkpoint(results, out_csv)
-    if results:
-        _checkpoint(results, out_csv)
 
     return pd.read_csv(out_csv) if out_csv.exists() else pd.DataFrame(results)
 

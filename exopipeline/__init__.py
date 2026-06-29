@@ -7,6 +7,7 @@ Stages (each module is a thin, testable wrapper around one scientific step):
     search    -> blind BLS broad sweep + iterative masking + narrow TLS refine
     vetting   -> physics-aware false-positive features (one row per candidate)
     classify  -> calibrated LightGBM classifier (transit / EB / blend / other)
+    cnn       -> dual-view 1D-CNN (Astronet-style) + late-fusion ensemble with classify
     blend     -> difference-imaging centroid test + CROWDSAP dilution
     fit       -> batman + scipy seed + emcee posterior parameters with uncertainties
     report    -> the multi-panel vetting sheet
@@ -31,6 +32,7 @@ __all__ = [
     "search",
     "vetting",
     "classify",
+    "cnn",
     "blend",
     "fit",
     "report",

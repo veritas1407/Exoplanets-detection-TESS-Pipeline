@@ -10,13 +10,18 @@ emcee
 corner
 scipy
 
-# Classifier
+# Classifier (tabular)
 lightgbm
 scikit-learn
 imbalanced-learn
 pandas
 pyarrow
 joblib
+
+# Classifier (CNN, Track B — dual-view 1D-CNN). CPU build is plenty for these small
+# 1D convnets; on Colab/GPU plain `torch` works too:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
 
 # Data access
 astroquery
