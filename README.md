@@ -20,8 +20,10 @@ planet parameters with honest posterior uncertainties.
 | `fit.py` | 7 | batman + scipy seed + emcee → parameters with 16/84th-pct credible intervals |
 | `report.py` | 8 | The one-page vetting sheet |
 | `scan.py` | — | **Blind batch scan of a whole sector slice** — the PS7 O2→O6 driver (two-tier, checkpointed) |
+| `featurize.py` | — | **Parallel shared builder** — features + CNN views in one multiprocess pass (training set) |
+| `predict.py` | — | **Explainable inference entrypoint** — raw light curve → justified verdict (the test API) |
 | `injection.py` | — | Injection-recovery completeness test (recovery vs SNR) |
-| `labels.py` | — | TOI-catalog label assembly + feature-table builder |
+| `labels.py` | — | TOI + TESS-EB label assembly, clean/scaled balanced sample, field-star "other" |
 
 ### How the modules map to the PS7 objectives
 | Objective | Implemented by |
@@ -143,6 +145,35 @@ With clean labels the ensemble beats both single tracks (as the literature expec
 the CNN (folded shape) and LightGBM (engineered vetting features) become complementary. A
 learning-curve check confirmed the cause: under noisy labels, *doubling* the training data did
 not help — the cap was label noise, not data quantity. See `labels.build_clean_sample`.
+
+### Feature engineering + scaling (5-fold CV macro-F1)
+After fixing labels, the next gains came from **better features** and **more data**. Six SOTA
+diagnostics were added (`vetting.py`, 15 → 21 features): **stellar-density consistency**
+(transit-implied ρ⋆ vs catalog ρ⋆), **explicit V-shape**, **transit/secondary SNR**,
+**per-transit depth scatter**, and **phase coverage**. The training set was scaled with the
+parallel builder (`featurize.py`) and a field-star **"other"** class (fixes the 79-sample
+bottleneck). Stratified 5-fold CV on 445 balanced targets:
+
+| Configuration | CV macro-F1 |
+|---|---|
+| 15 original features | 0.804 |
+| **21 features (+6 SOTA diagnostics)** | **0.868**  (+0.063) |
+| **21 features + hyperparameter tuning** (`tune_lightgbm`) | **0.883** |
+| Augmented dual-view CNN (held-out) | 0.822 |
+
+Full arc: ensemble **0.59** (noisy labels) → **0.79** (clean labels, 237) → **0.883**
+(445 targets + new features + tuning) — at the top of the SOTA TESS-vetter band (0.76–0.88).
+Scaling to ~2–3k on Colab (`notebooks/colab_train.ipynb`) is the next step for the unknown
+test set. The new features are auxiliary physics derived from the light curve (ρ⋆ uses only
+stellar R⋆/M⋆ as auxiliary info) — no catalog transit/disposition parameters are used as
+features.
+
+### Explainable inference (`predict.py`)
+`predict.predict_lightcurve / predict_fits / predict_target / predict_batch` are the single
+entrypoint for an unknown test set: a raw light curve → detect → classify → significance →
+(optional) MCMC parameters → blend flag, plus a **human-readable verdict** justifying the
+call, e.g. *"Planet candidate (99%): periodic 3734 ppm dip at P=5.6604 d (5 transits,
+SDE=13.6, SNR=37.2)."* Robust to arrays / FITS / TIC and to the no-detection case (→ "other").
 
 ## Data — what to download (and what *not* to)
 The PS links `archive.stsci.edu/tess/tic_ctl.html`. **That page is the TIC/CTL star
