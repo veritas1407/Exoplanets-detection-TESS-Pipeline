@@ -85,18 +85,63 @@ def fetch_toi_clean(force=False) -> pd.DataFrame:
     return df.dropna(subset=["label", "tid", "pl_orbper"])
 
 
-def build_clean_sample(per_class=80, tmag_max=12.5, seed=42) -> pd.DataFrame:
+def field_star_sample(n, sectors=(5, 4, 3), exclude_tids=None, seed=42) -> pd.DataFrame:
+    """Random bright field stars (2-min targets) NOT in the TOI/EB catalogs -> 'other'.
+
+    These have no known ephemeris; the featurizer takes their strongest *blind* BLS peak,
+    which is exactly the test-time false-positive scenario (a random star whose BLS peak is
+    noise/stellar variability). Reuses cached sector manifests; sector-5 stars are already
+    largely cached from the scan.
+    """
+    from . import ingest
+    rng = np.random.default_rng(seed)
+    exclude = set(int(t) for t in (exclude_tids or []))
+    frames = []
+    for s in sectors:
+        try:
+            frames.append(ingest.sector_lc_manifest(s)[["tic", "tid"]])
+        except Exception as e:
+            print(f"[labels] manifest sector {s} unavailable: {e}")
+    if not frames:
+        return pd.DataFrame(columns=["tic", "tid", "label", "pl_orbper", "st_tmag"])
+    man = pd.concat(frames, ignore_index=True).drop_duplicates("tid")
+    man = man[~man["tid"].isin(exclude)]
+    take = min(n, len(man))
+    out = man.sample(take, random_state=int(rng.integers(1e6))).copy()
+    out["label"] = "other"
+    out["pl_orbper"] = np.nan      # no known period -> blind search in the featurizer
+    out["st_tmag"] = np.nan
+    return out[["tic", "tid", "label", "pl_orbper", "st_tmag"]]
+
+
+def build_clean_sample(per_class=80, tmag_max=12.5, seed=42,
+                       other_from_field=True) -> pd.DataFrame:
     """Class-balanced sample with CLEAN labels: confirmed planets (transit), real EBs from
-    the TESS EB catalog (eclipsing_binary), and TOI false alarms (other).
+    the TESS EB catalog (eclipsing_binary), and 'other' = TOI false-alarms + (optionally)
+    random field stars to reach class balance at large ``per_class``.
 
     Columns: tic, tid, label, pl_orbper, st_tmag.
     """
     cols = ["tic", "tid", "label", "pl_orbper", "st_tmag"]
     toi = fetch_toi_clean()
     eb = fetch_tess_eb()
-    pool = pd.concat([toi[toi["label"].isin(["transit", "other"])][cols], eb[cols]],
-                     ignore_index=True)
-    return balanced_sample(pool, per_class=per_class, tmag_max=tmag_max, seed=seed)
+
+    transit = balanced_sample(toi[toi["label"] == "transit"][cols],
+                              per_class=per_class, tmag_max=tmag_max, seed=seed)
+    ebs = balanced_sample(eb[cols], per_class=per_class, tmag_max=tmag_max, seed=seed)
+
+    fa = toi[toi["label"] == "other"][cols]
+    if "st_tmag" in fa:
+        fa = fa[fa["st_tmag"] <= tmag_max]
+    fa = fa.drop_duplicates("tic")
+    other = fa
+    if other_from_field and len(fa) < per_class:
+        used = set(transit["tid"]) | set(ebs["tid"]) | set(toi["tid"]) | set(eb["tid"])
+        field = field_star_sample(per_class - len(fa), exclude_tids=used, seed=seed)
+        other = pd.concat([fa, field], ignore_index=True)
+    other = other.head(per_class)
+
+    return pd.concat([transit, ebs, other], ignore_index=True)
 
 
 def balanced_sample(df: pd.DataFrame, per_class=60, tmag_max=12.5,

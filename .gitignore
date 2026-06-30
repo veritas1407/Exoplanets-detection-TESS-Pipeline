@@ -24,6 +24,7 @@ env/
 data/cache/
 data/labels/toi_catalog*.csv
 data/labels/tess_eb_catalog.csv
+data/labels/stellar_cache.csv
 data/labels/sector_*_manifest.parquet
 data/features/sector_*_candidates.csv
 data/features/*_SMOKE*

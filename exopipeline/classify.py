@@ -55,7 +55,7 @@ def load_feature_table(path=None) -> pd.DataFrame:
 # Training
 # --------------------------------------------------------------------------------------
 def train(df: pd.DataFrame, calibrate=True, test_size=0.25, random_state=42,
-          use_smote=True):
+          use_smote=True, params=None):
     """Train + (isotonic) calibrate a LightGBM multiclass classifier.
 
     Returns a dict with the fitted model, the held-out split, predictions, and a metrics
@@ -85,10 +85,12 @@ def train(df: pd.DataFrame, calibrate=True, test_size=0.25, random_state=42,
         except Exception as e:
             print(f"[classify] SMOTE skipped: {e}")
 
+    base_params = dict(n_estimators=400, learning_rate=0.05, num_leaves=31)
+    if params:
+        base_params.update(params)
     base = lgb.LGBMClassifier(
-        objective="multiclass", n_estimators=400, learning_rate=0.05,
-        num_leaves=31, subsample=0.8, colsample_bytree=0.8,
-        class_weight="balanced", random_state=random_state, verbose=-1)
+        objective="multiclass", subsample=0.8, colsample_bytree=0.8,
+        class_weight="balanced", random_state=random_state, verbose=-1, **base_params)
 
     if calibrate:
         # cv='prefit' would need a holdout; use internal CV calibration instead.
@@ -114,6 +116,53 @@ def train(df: pd.DataFrame, calibrate=True, test_size=0.25, random_state=42,
     return dict(model=model, classes=model_classes,
                 X_test=X_te, y_test=y_te, y_pred=y_pred, proba=proba,
                 report=report, confusion_matrix=cm, pr_auc=pr_auc)
+
+
+def cross_validate(df: pd.DataFrame, n_splits=5, params=None, random_state=42):
+    """Stratified k-fold CV macro-F1 for the tabular model (the honest headline metric).
+
+    Returns dict(mean, std, per_fold, oof_pred, oof_true).
+    """
+    import lightgbm as lgb
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import f1_score
+
+    X = df[config.FEATURE_COLUMNS].astype(float).fillna(-99.0).values
+    y = df["label"].values
+    params = params or dict(n_estimators=400, learning_rate=0.05, num_leaves=31)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    scores, oof_p, oof_t = [], [], []
+    for tr, te in skf.split(X, y):
+        m = lgb.LGBMClassifier(objective="multiclass", class_weight="balanced",
+                               random_state=random_state, verbose=-1, **params)
+        m.fit(X[tr], y[tr])
+        p = m.predict(X[te])
+        scores.append(f1_score(y[te], p, average="macro"))
+        oof_p.extend(p.tolist()); oof_t.extend(y[te].tolist())
+    return dict(mean=float(np.mean(scores)), std=float(np.std(scores)),
+                per_fold=scores, oof_pred=oof_p, oof_true=oof_t)
+
+
+def tune_lightgbm(df: pd.DataFrame, n_splits=4, random_state=42, verbose=True):
+    """Small grid search on CV macro-F1. Returns (best_params, best_score, all_results)."""
+    from itertools import product
+    grid = dict(
+        num_leaves=[15, 31, 63],
+        n_estimators=[300, 600],
+        learning_rate=[0.03, 0.05, 0.1],
+        min_child_samples=[5, 20],
+    )
+    keys = list(grid)
+    best, best_score, results = None, -1.0, []
+    for combo in product(*[grid[k] for k in keys]):
+        params = dict(zip(keys, combo))
+        cv = cross_validate(df, n_splits=n_splits, params=params, random_state=random_state)
+        results.append((params, cv["mean"]))
+        if cv["mean"] > best_score:
+            best, best_score = params, cv["mean"]
+    if verbose:
+        print(f"[classify] best CV macro-F1 = {best_score:.3f} with {best}")
+    return best, best_score, results
 
 
 def save_model(model, path=None):
@@ -142,10 +191,13 @@ def predict(features: dict, model=None) -> tuple[str, float]:
     if model is None:
         return verdict_heuristic(features)
 
-    x = np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]],
-                 dtype=float)
-    x = np.nan_to_num(x, nan=-99.0)
-    proba = model.predict_proba(x)[0]
+    try:
+        x = np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]],
+                     dtype=float)
+        x = np.nan_to_num(x, nan=-99.0)
+        proba = model.predict_proba(x)[0]
+    except Exception:
+        return verdict_heuristic(features)   # stale model (feature mismatch) -> heuristic
     classes = list(model.classes_)
     i = int(np.argmax(proba))
     return classes[i], float(proba[i])

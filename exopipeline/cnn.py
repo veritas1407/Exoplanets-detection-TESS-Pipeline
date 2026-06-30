@@ -179,9 +179,31 @@ def _build_model(n_classes, n_global=N_GLOBAL, n_local=N_LOCAL):
     return DualViewCNN()
 
 
+def _augment_batch(xg, xl, rng, noise=0.02, max_roll=8, depth_jitter=0.1):
+    """On-the-fly augmentation for the dual views (combats small-data overfitting):
+    random phase-roll of the global view, Gaussian noise, and depth (amplitude) jitter.
+    ``xg``/``xl`` are (B,1,L) torch tensors. Returns new augmented tensors."""
+    import torch
+    B = xg.shape[0]
+    # phase-roll the (periodic) global view
+    shift = int(rng.integers(-max_roll, max_roll + 1))
+    xg = torch.roll(xg, shifts=shift, dims=-1)
+    # depth/amplitude jitter (both views scaled together)
+    scale = float(rng.uniform(1 - depth_jitter, 1 + depth_jitter))
+    xg = xg * scale
+    xl = xl * scale
+    # additive Gaussian noise
+    xg = xg + torch.randn_like(xg) * noise
+    xl = xl + torch.randn_like(xl) * noise
+    return xg, xl
+
+
 def train_cnn(Xg, Xl, y, n_epochs=60, batch_size=32, lr=1e-3, test_size=0.25,
-              random_state=42, save=True, verbose=True):
-    """Train the dual-view CNN. Returns a bundle dict (model, classes, metrics, split)."""
+              random_state=42, save=True, augment=True, verbose=True):
+    """Train the dual-view CNN. Returns a bundle dict (model, classes, metrics, split).
+
+    ``augment`` applies on-the-fly phase-roll / noise / depth-jitter to each training batch.
+    """
     import torch
     import torch.nn as nn
     from sklearn.model_selection import train_test_split
@@ -217,8 +239,11 @@ def train_cnn(Xg, Xl, y, n_epochs=60, batch_size=32, lr=1e-3, test_size=0.25,
         tot = 0.0
         for s in range(0, n, batch_size):
             b = perm[s:s + batch_size]
+            xg_b, xl_b = Xg_tr_t[b], Xl_tr_t[b]
+            if augment:
+                xg_b, xl_b = _augment_batch(xg_b, xl_b, rng)
             opt.zero_grad()
-            out = model(Xg_tr_t[b], Xl_tr_t[b])
+            out = model(xg_b, xl_b)
             loss = loss_fn(out, y_tr_t[b])
             loss.backward(); opt.step()
             tot += float(loss) * len(b)
@@ -290,10 +315,13 @@ def predict_ensemble(features, global_view, local_view,
         tab_model = classify.load_model()
     tab_p = None
     if tab_model is not None:
-        x = np.nan_to_num(
-            np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]], float),
-            nan=-99.0)
-        tab_p = dict(zip(list(tab_model.classes_), tab_model.predict_proba(x)[0]))
+        try:
+            x = np.nan_to_num(
+                np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]], float),
+                nan=-99.0)
+            tab_p = dict(zip(list(tab_model.classes_), tab_model.predict_proba(x)[0]))
+        except Exception:
+            tab_p = None        # stale model (feature-count mismatch) -> skip tabular
 
     # cnn probabilities
     cnn_p = None

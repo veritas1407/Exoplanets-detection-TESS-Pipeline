@@ -96,9 +96,10 @@ DEFAULT_RSTAR_SUN = 0.420     # TOI 700 radius; override per target
 CLASSES = ["transit", "eclipsing_binary", "blend", "other"]
 FEATURE_COLUMNS = [
     "period", "depth_ppm", "duration_hr", "sde", "snr", "log_fap",
-    "odd_even_diff_ppm", "odd_even_sigma", "secondary_ppm",
-    "flatness", "n_transits", "snr_per_transit", "dur_over_period",
-    "rp_rs", "crowdsap",
+    "odd_even_diff_ppm", "odd_even_sigma", "secondary_ppm", "secondary_snr",
+    "flatness", "vshape_ratio", "n_transits", "snr_per_transit", "transit_snr",
+    "depth_consistency", "phase_coverage", "dur_over_period",
+    "rho_ratio", "rp_rs", "crowdsap",
 ]
 
 # --------------------------------------------------------------------------------------

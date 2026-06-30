@@ -20,7 +20,38 @@ def fold_phase(t, P, T0):
     return (t - T0 + 0.5 * P) % P - 0.5 * P
 
 
-def compute_features(time, flat_flux, candidate, crowdsap=np.nan) -> dict:
+_G_CGS = 6.674e-8        # gravitational constant, cgs
+_RHO_SUN = 1.408         # mean solar density, g/cc
+
+
+def _density_ratio(period_days, t14_days, depth_frac, rstar_sun, mstar_sun):
+    """log10( transit-derived stellar density / catalog stellar density ).
+
+    A core false-positive diagnostic: the transit duration implies a stellar density
+    (assuming a central, circular planetary orbit); if it disagrees with the catalog
+    density (from R*, M*) the event is likely an EB / blend / wrong period. Computed in
+    consistent cgs units so the ratio is physical (≈0 in log for a real planet).
+
+    a/R* ~ (P / (pi*T14)) * (1 + sqrt(depth))  [small-planet central-transit approx];
+    rho_transit = 3*pi/(G * P_sec^2) * (a/R*)^3.  Returns NaN if inputs are unusable.
+    """
+    if not (np.isfinite(rstar_sun) and np.isfinite(mstar_sun) and rstar_sun > 0
+            and mstar_sun > 0 and t14_days and t14_days > 0 and period_days > 0):
+        return np.nan
+    depth = max(depth_frac, 0.0)
+    a_rs = (period_days / (np.pi * t14_days)) * (1.0 + np.sqrt(depth))
+    if not np.isfinite(a_rs) or a_rs <= 1:
+        return np.nan
+    p_sec = period_days * 86400.0
+    rho_transit = 3.0 * np.pi / (_G_CGS * p_sec ** 2) * a_rs ** 3      # g/cc
+    rho_catalog = _RHO_SUN * mstar_sun / rstar_sun ** 3               # g/cc
+    if rho_catalog <= 0 or rho_transit <= 0:
+        return np.nan
+    return float(np.log10(rho_transit / rho_catalog))
+
+
+def compute_features(time, flat_flux, candidate, crowdsap=np.nan,
+                     rstar_sun=np.nan, mstar_sun=np.nan) -> dict:
     """Compute the full vetting-feature vector for one candidate.
 
     Parameters
@@ -31,6 +62,9 @@ def compute_features(time, flat_flux, candidate, crowdsap=np.nan) -> dict:
         .distinct_transit_count  (an exopipeline.search.Candidate, or any namespace).
     crowdsap : float
         Dilution keyword, carried into the feature row for the classifier.
+    rstar_sun, mstar_sun : float
+        Stellar radius / mass (solar units) for the stellar-density consistency feature.
+        Auxiliary stellar info only (not transit/disposition parameters); NaN -> feature NaN.
     """
     time = np.asarray(time, dtype="float64")
     flat_flux = np.asarray(flat_flux, dtype="float64")
@@ -62,6 +96,10 @@ def compute_features(time, flat_flux, candidate, crowdsap=np.nan) -> dict:
     ph_sec = fold_phase(time, P, t0 + 0.5 * P)
     sec_in = np.abs(ph_sec) < 0.5 * dur
     depth_secondary = _depth(sec_in)
+    # secondary significance (how many sigma is the phase-0.5 dip)
+    n_sec = max(int(sec_in.sum()), 1)
+    secondary_snr = (depth_secondary * 1e-6) / (scatter / np.sqrt(n_sec)) \
+        if scatter > 0 and np.isfinite(depth_secondary) else np.nan
 
     # --- Primary depth + U/V shape ----------------------------------------------------
     depth_primary = _depth(in_tr)
@@ -69,6 +107,10 @@ def compute_features(time, flat_flux, candidate, crowdsap=np.nan) -> dict:
     depth_core = _depth(core)
     flatness = (depth_core / depth_primary) if depth_primary and depth_primary > 0 \
         else np.nan
+    # explicit V-shape: wing depth (0.25-0.5 dur) vs core depth; EBs are V (wings deep)
+    wing = (np.abs(ph) >= 0.25 * dur) & (np.abs(ph) < 0.5 * dur)
+    depth_wing = _depth(wing)
+    vshape_ratio = (depth_wing / depth_core) if depth_core and depth_core > 0 else np.nan
 
     # --- Counting / SNR ---------------------------------------------------------------
     n_transits = int(getattr(candidate, "distinct_transit_count", 0)) or \
@@ -77,6 +119,29 @@ def compute_features(time, flat_flux, candidate, crowdsap=np.nan) -> dict:
     snr_per_transit = (depth_primary * 1e-6) / (scatter / np.sqrt(max(pts_per_transit, 1))) \
         if scatter > 0 and np.isfinite(depth_primary) else np.nan
     dur_over_period = dur / P
+    # total transit SNR (MES-like): depth * sqrt(N_in) / scatter
+    transit_snr = (depth_primary * 1e-6) * np.sqrt(max(int(in_tr.sum()), 1)) / scatter \
+        if scatter > 0 and np.isfinite(depth_primary) else np.nan
+
+    # --- Per-transit depth consistency (real transits repeat; noise/variables don't) --
+    per_depths = []
+    for e in np.unique(epoch[in_tr]):
+        m = in_tr & (epoch == e)
+        if m.sum() >= 2:
+            per_depths.append((base - np.median(flat_flux[m])) * 1e6)
+    if len(per_depths) >= 2 and depth_primary and abs(depth_primary) > 0:
+        depth_consistency = float(np.std(per_depths) / abs(depth_primary))
+    else:
+        depth_consistency = np.nan
+
+    # --- Phase coverage (data completeness across the orbit) --------------------------
+    nb = 50
+    bins = np.floor((ph / P + 0.5) * nb).astype(int)
+    phase_coverage = float(len(np.unique(np.clip(bins, 0, nb - 1))) / nb)
+
+    # --- Stellar-density consistency --------------------------------------------------
+    depth_frac = (depth_primary * 1e-6) if np.isfinite(depth_primary) else np.nan
+    rho_ratio = _density_ratio(P, dur, depth_frac, rstar_sun, mstar_sun)
 
     fap = float(getattr(candidate, "FAP", np.nan))
     log_fap = np.log10(fap) if (np.isfinite(fap) and fap > 0) else -12.0
@@ -91,10 +156,16 @@ def compute_features(time, flat_flux, candidate, crowdsap=np.nan) -> dict:
         "odd_even_diff_ppm": odd_even_diff,
         "odd_even_sigma": odd_even_sigma,
         "secondary_ppm": depth_secondary,
+        "secondary_snr": secondary_snr,
         "flatness": flatness,
+        "vshape_ratio": vshape_ratio,
         "n_transits": n_transits,
         "snr_per_transit": snr_per_transit,
+        "transit_snr": transit_snr,
+        "depth_consistency": depth_consistency,
+        "phase_coverage": phase_coverage,
         "dur_over_period": dur_over_period,
+        "rho_ratio": rho_ratio,
         "rp_rs": float(getattr(candidate, "rp_rs", np.nan)),
         "crowdsap": float(crowdsap),
         # extras kept for plotting / reporting (not classifier columns)

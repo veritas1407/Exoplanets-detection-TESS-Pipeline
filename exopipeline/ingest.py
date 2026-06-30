@@ -297,6 +297,68 @@ def load_lc_from_url(url: str, lc_file: str | None = None,
     return star
 
 
+_STELLAR_CACHE: dict = {}
+
+
+def fetch_stellar(target) -> tuple:
+    """Return ``(rstar_sun, mstar_sun)`` for a TIC from the TESS Input Catalog.
+
+    Auxiliary stellar info for the stellar-density consistency feature. Cached in-memory
+    (and to ``data/labels/stellar_cache.csv``). Returns ``(nan, nan)`` on any failure.
+    """
+    import pandas as pd
+
+    tid = _tid_of(target)
+    if tid is None:
+        return (np.nan, np.nan)
+    if tid in _STELLAR_CACHE:
+        return _STELLAR_CACHE[tid]
+
+    cache_path = config.LABELS_DIR / "stellar_cache.csv"
+    if not _STELLAR_CACHE and cache_path.exists():
+        try:
+            df = pd.read_csv(cache_path)
+            _STELLAR_CACHE.update({int(r.tid): (float(r.rstar), float(r.mstar))
+                                   for r in df.itertuples()})
+            if tid in _STELLAR_CACHE:
+                return _STELLAR_CACHE[tid]
+        except Exception:
+            pass
+
+    rstar = mstar = np.nan
+    try:
+        from astroquery.mast import Catalogs
+        cat = Catalogs.query_criteria(catalog="Tic", ID=tid)
+        if len(cat):
+            rstar = float(cat["rad"][0]) if cat["rad"][0] is not None else np.nan
+            mstar = float(cat["mass"][0]) if cat["mass"][0] is not None else np.nan
+    except Exception:
+        pass
+
+    _STELLAR_CACHE[tid] = (rstar, mstar)
+    try:
+        import csv
+        new = not cache_path.exists()
+        with open(cache_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["tid", "rstar", "mstar"])
+            w.writerow([tid, rstar, mstar])
+    except Exception:
+        pass
+    return (rstar, mstar)
+
+
+def _tid_of(target):
+    """Extract the integer TIC id from a 'TIC 12345' string or an int."""
+    try:
+        if isinstance(target, (int, np.integer)):
+            return int(target)
+        return int(str(target).upper().replace("TIC", "").strip())
+    except Exception:
+        return None
+
+
 def load_tpf(target: str, sector: int | None = None):
     """Fetch a SPOC 2-min Target Pixel File for the difference-imaging blend test.
 

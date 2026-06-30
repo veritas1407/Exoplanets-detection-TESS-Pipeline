@@ -37,6 +37,8 @@ __all__ = [
     "fit",
     "report",
     "scan",
+    "featurize",
+    "predict",
     "injection",
     "labels",
 ]
