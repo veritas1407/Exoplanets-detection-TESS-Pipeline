@@ -287,17 +287,26 @@ def load_cnn(path=None):
 # --------------------------------------------------------------------------------------
 # Prediction + late-fusion ensemble
 # --------------------------------------------------------------------------------------
-def predict_cnn(global_view, local_view, model=None, classes=None):
-    """Return (class, confidence) from the CNN for one pair of views."""
+def predict_cnn(global_view, local_view, model=None, classes=None, n_tta=8):
+    """Return (class, confidence) from the CNN for one pair of views.
+
+    ``n_tta`` > 1 enables test-time augmentation: the global view is phase-rolled
+    ``n_tta`` times and probabilities are averaged, giving more robust predictions.
+    """
     import torch
     if model is None:
         model, classes = load_cnn()
     if model is None:
         raise RuntimeError("No trained CNN found; train it first.")
-    xg = torch.tensor(global_view, dtype=torch.float32).view(1, 1, -1)
+    gv = np.asarray(global_view, dtype="float32")
     xl = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
+    rolls = [0] if n_tta <= 1 else np.linspace(0, len(gv), n_tta, endpoint=False).astype(int)
+    probs = []
     with torch.no_grad():
-        p = torch.softmax(model(xg, xl), dim=1).numpy()[0]
+        for r in rolls:
+            xg = torch.tensor(np.roll(gv, r), dtype=torch.float32).view(1, 1, -1)
+            probs.append(torch.softmax(model(xg, xl), dim=1).numpy()[0])
+    p = np.mean(probs, axis=0)
     i = int(p.argmax())
     return classes[i], float(p[i])
 
@@ -323,17 +332,21 @@ def predict_ensemble(features, global_view, local_view,
         except Exception:
             tab_p = None        # stale model (feature-count mismatch) -> skip tabular
 
-    # cnn probabilities
+    # cnn probabilities (with TTA: 8 phase rolls averaged)
     cnn_p = None
     if cnn_model is None:
         cnn_model, cnn_classes = load_cnn()
     if cnn_model is not None:
         import torch
-        xg = torch.tensor(global_view, dtype=torch.float32).view(1, 1, -1)
-        xl = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
+        gv = np.asarray(global_view, dtype="float32")
+        xl_t = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
+        rolls = np.linspace(0, len(gv), 8, endpoint=False).astype(int)
+        probs = []
         with torch.no_grad():
-            p = torch.softmax(cnn_model(xg, xl), dim=1).numpy()[0]
-        cnn_p = dict(zip(cnn_classes, p))
+            for r in rolls:
+                xg = torch.tensor(np.roll(gv, r), dtype=torch.float32).view(1, 1, -1)
+                probs.append(torch.softmax(cnn_model(xg, xl_t), dim=1).numpy()[0])
+        cnn_p = dict(zip(cnn_classes, np.mean(probs, axis=0)))
 
     if tab_p is None and cnn_p is None:
         return classify.predict(features)
