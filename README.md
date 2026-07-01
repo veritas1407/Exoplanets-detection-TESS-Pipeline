@@ -168,6 +168,35 @@ test set. The new features are auxiliary physics derived from the light curve (�
 stellar R⋆/M⋆ as auxiliary info) — no catalog transit/disposition parameters are used as
 features.
 
+### SOTA literature techniques adopted — and one rejected (`cnn.py`)
+Three peer-reviewed TESS-CNN papers were reviewed for concrete, implementable gains
+(Schanche+2020 A&A; two Xception-transfer-learning papers). Adopted: **phase-mirroring
+augmentation** (`_augment_batch`, +1–2 pts per Schanche+2020's reported 3.1 AP-point drop
+when removed), a **deeper residual dual-view CNN** (5 conv layers global / 4 local, with
+BatchNorm + skip connections, vs. the original 3+3 shallow branches), and **k-fold bagging**
+of both the LightGBM and CNN tracks (`load_fold_models` / `load_cnn_folds`, average
+predictions across 5 folds — reduces variance the same way Schanche+2020's k=8 bagging does).
+
+We also tested **early-fusion** (Astronet-Triage-v2 / Tey+2023 style: feed the 21 vetting
+features directly into the CNN's dense head, alongside the conv-branch features, instead of
+averaging two separately-trained models). Head-to-head 5-fold CV on the same 445-target
+split:
+
+| Approach | Macro-F1 |
+|---|---|
+| Tabular only (LightGBM) | 0.863 ± 0.050 |
+| CNN only (dual-view) | 0.734 ± 0.050 |
+| **Late-fusion ensemble (adopted)** | **0.848 ± 0.039** |
+| Early-fusion CNN (rejected) | 0.727 ± 0.049 |
+
+Early fusion **underperformed** late fusion by 12 points — at this data scale (~350
+training targets/fold) forcing one network to jointly learn shape features, tabular
+embeddings, and the decision boundary is a harder optimization problem than training two
+specialists (LightGBM dominates tabular; CNN reads shape) and averaging. This is a textbook
+small-data result: ensemble-of-specialists beats end-to-end joint fusion until the training
+set is much larger. The experiment (`cnn._build_model_fused` / `cnn.train_cnn_fused`) is
+kept in the codebase as a documented, tested negative result rather than deleted.
+
 ### Explainable inference (`predict.py`)
 `predict.predict_lightcurve / predict_fits / predict_target / predict_batch` are the single
 entrypoint for an unknown test set: a raw light curve → detect → classify → significance →

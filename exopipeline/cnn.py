@@ -153,14 +153,9 @@ def load_view_dataset(path=None):
 # --------------------------------------------------------------------------------------
 # Model (PyTorch, imported lazily)
 # --------------------------------------------------------------------------------------
-def _build_model(n_classes, n_global=N_GLOBAL, n_local=N_LOCAL):
-    """Deeper dual-view 1D-CNN with residual blocks (Schanche+2020-inspired).
-
-    Global branch: 5 conv layers (1->16->32->ResBlock->64->ResBlock->128) -> 512 feats.
-    Local branch : 4 conv layers (1->16->32->ResBlock->64)               -> 256 feats.
-    BatchNorm on the deeper layers stabilises training; skip connections ease optimisation.
-    """
-    import torch
+def _res_block_cls():
+    """Return the ResBlock1d class (module-level factory so it's built lazily, after
+    torch is confirmed importable, without duplicating the definition per model)."""
     import torch.nn as nn
 
     class ResBlock1d(nn.Module):
@@ -177,29 +172,50 @@ def _build_model(n_classes, n_global=N_GLOBAL, n_local=N_LOCAL):
             r = self.relu(self.bn1(self.conv1(x)))
             return self.relu(self.bn2(self.conv2(r)) + x)
 
-    def global_branch():
-        return nn.Sequential(
-            nn.Conv1d(1, 16, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(16, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            ResBlock1d(32),
-            nn.Conv1d(32, 64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
-            ResBlock1d(64),
-            nn.Conv1d(64, 128, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveMaxPool1d(4), nn.Flatten())          # -> 128*4 = 512
+    return ResBlock1d
 
-    def local_branch():
-        return nn.Sequential(
-            nn.Conv1d(1, 16, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(16, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            ResBlock1d(32),
-            nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveMaxPool1d(4), nn.Flatten())          # -> 64*4 = 256
+
+def _global_branch():
+    """5 conv layers (1->16->32->ResBlock->64->ResBlock->128) -> 512 feats."""
+    import torch.nn as nn
+    ResBlock1d = _res_block_cls()
+    return nn.Sequential(
+        nn.Conv1d(1, 16, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
+        nn.Conv1d(16, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+        ResBlock1d(32),
+        nn.Conv1d(32, 64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
+        ResBlock1d(64),
+        nn.Conv1d(64, 128, 3, padding=1), nn.ReLU(),
+        nn.AdaptiveMaxPool1d(4), nn.Flatten())          # -> 128*4 = 512
+
+
+def _local_branch():
+    """4 conv layers (1->16->32->ResBlock->64) -> 256 feats."""
+    import torch.nn as nn
+    ResBlock1d = _res_block_cls()
+    return nn.Sequential(
+        nn.Conv1d(1, 16, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
+        nn.Conv1d(16, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+        ResBlock1d(32),
+        nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
+        nn.AdaptiveMaxPool1d(4), nn.Flatten())          # -> 64*4 = 256
+
+
+def _build_model(n_classes, n_global=N_GLOBAL, n_local=N_LOCAL):
+    """Deeper dual-view 1D-CNN with residual blocks (Schanche+2020-inspired).
+
+    Global branch -> 512 feats, local branch -> 256 feats, late-fused with the tabular
+    LightGBM at inference (see :func:`ensemble_proba`). BatchNorm + skip connections
+    stabilise training on a small dataset.
+    """
+    import torch
+    import torch.nn as nn
 
     class DualViewCNN(nn.Module):
         def __init__(self):
             super().__init__()
-            self.g = global_branch()
-            self.l = local_branch()
+            self.g = _global_branch()
+            self.l = _local_branch()
             feat = 128 * 4 + 64 * 4                          # 512 + 256 = 768
             self.head = nn.Sequential(
                 nn.Linear(feat, 256), nn.ReLU(), nn.Dropout(0.3),
@@ -210,6 +226,105 @@ def _build_model(n_classes, n_global=N_GLOBAL, n_local=N_LOCAL):
             return self.head(torch.cat([self.g(xg), self.l(xl)], dim=1))
 
     return DualViewCNN()
+
+
+def _build_model_fused(n_classes, n_features, n_global=N_GLOBAL, n_local=N_LOCAL):
+    """Early-fusion dual-view CNN (Astronet-Triage-v2 / Tey+2023 style): the 21 vetting
+    features are embedded through a small MLP and concatenated with the CNN's conv features
+    *before* the dense head, so the network can condition its shape-reading on e.g. stellar
+    density or odd-even signal directly, rather than only averaging with LightGBM afterward.
+    """
+    import torch
+    import torch.nn as nn
+
+    class FusedCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.g = _global_branch()
+            self.l = _local_branch()
+            self.feat_embed = nn.Sequential(
+                nn.Linear(n_features, 32), nn.ReLU(), nn.Dropout(0.2))
+            feat = 128 * 4 + 64 * 4 + 32                     # 512 + 256 + 32 = 800
+            self.head = nn.Sequential(
+                nn.Linear(feat, 256), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(128, n_classes))
+
+        def forward(self, xg, xl, xf):
+            fe = self.feat_embed(xf)
+            return self.head(torch.cat([self.g(xg), self.l(xl), fe], dim=1))
+
+    return FusedCNN()
+
+
+def train_cnn_fused(Xg, Xl, Xtab, y, n_epochs=150, batch_size=32, lr=1e-3,
+                    test_size=0.25, random_state=42, augment=True, verbose=True):
+    """Train the early-fusion CNN (views + tabular vetting features -> shared dense head).
+
+    ``Xtab`` is the (N, n_features) array of vetting features (NaN-filled, same feature
+    order as ``config.FEATURE_COLUMNS``). Only the views get phase-roll/mirror/noise
+    augmentation; the tabular features pass through unperturbed. Returns a metrics bundle
+    matching :func:`train_cnn`'s shape (model, classes, proba, y_test, y_pred, report, cm)."""
+    import torch
+    import torch.nn as nn
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report, confusion_matrix
+
+    classes = sorted(np.unique(y).tolist())
+    cls_idx = {c: i for i, c in enumerate(classes)}
+    yi = np.array([cls_idx[v] for v in y])
+    n_features = Xtab.shape[1]
+
+    idx_tr, idx_te = train_test_split(np.arange(len(yi)), test_size=test_size,
+                                      random_state=random_state, stratify=yi)
+
+    def _t(a):
+        return torch.tensor(a, dtype=torch.float32).unsqueeze(1)   # (N,1,L)
+
+    Xg_tr_t, Xl_tr_t = _t(Xg[idx_tr]), _t(Xl[idx_tr])
+    Xg_te_t, Xl_te_t = _t(Xg[idx_te]), _t(Xl[idx_te])
+    Xf_tr_t = torch.tensor(Xtab[idx_tr], dtype=torch.float32)
+    Xf_te_t = torch.tensor(Xtab[idx_te], dtype=torch.float32)
+    y_tr_t = torch.tensor(yi[idx_tr], dtype=torch.long)
+    y_te = yi[idx_te]
+
+    counts = np.bincount(yi[idx_tr], minlength=len(classes)).astype(float)
+    w = torch.tensor(counts.sum() / np.maximum(counts, 1), dtype=torch.float32)
+
+    model = _build_model_fused(len(classes), n_features)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    loss_fn = nn.CrossEntropyLoss(weight=w)
+
+    n = Xg_tr_t.shape[0]
+    rng = np.random.default_rng(random_state)
+    for ep in range(n_epochs):
+        model.train()
+        perm = rng.permutation(n)
+        tot = 0.0
+        for s in range(0, n, batch_size):
+            b = perm[s:s + batch_size]
+            if len(b) < 2:
+                continue
+            xg_b, xl_b = Xg_tr_t[b], Xl_tr_t[b]
+            if augment:
+                xg_b, xl_b = _augment_batch(xg_b, xl_b, rng)
+            opt.zero_grad()
+            out = model(xg_b, xl_b, Xf_tr_t[b])
+            loss = loss_fn(out, y_tr_t[b])
+            loss.backward(); opt.step()
+            tot += float(loss) * len(b)
+        if verbose and (ep + 1) % 30 == 0:
+            print(f"[cnn-fused] epoch {ep+1}/{n_epochs}  loss={tot/n:.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        proba = torch.softmax(model(Xg_te_t, Xl_te_t, Xf_te_t), dim=1).numpy()
+    y_pred = proba.argmax(1)
+    report = classification_report(y_te, y_pred, labels=list(range(len(classes))),
+                                   target_names=classes, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_te, y_pred, labels=list(range(len(classes))))
+    return dict(model=model, classes=classes, proba=proba, y_test=y_te, y_pred=y_pred,
+                report=report, confusion_matrix=cm)
 
 
 def _augment_batch(xg, xl, rng, noise=0.02, max_roll=8, depth_jitter=0.1,
