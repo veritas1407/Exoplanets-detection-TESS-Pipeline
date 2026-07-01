@@ -29,6 +29,7 @@ N_LOCAL = 61
 LOCAL_DURATIONS = 2.5     # local view spans +/- this many transit durations
 VIEW_DATASET = config.FEATURES_DIR / "cnn_views.npz"
 CNN_MODEL_PATH = config.FEATURES_DIR / "cnn_model.pt"
+CNN_FOLD_PATH_TEMPLATE = str(config.FEATURES_DIR / "cnn_fold_{i}.pt")
 
 
 # --------------------------------------------------------------------------------------
@@ -153,41 +154,78 @@ def load_view_dataset(path=None):
 # Model (PyTorch, imported lazily)
 # --------------------------------------------------------------------------------------
 def _build_model(n_classes, n_global=N_GLOBAL, n_local=N_LOCAL):
+    """Deeper dual-view 1D-CNN with residual blocks (Schanche+2020-inspired).
+
+    Global branch: 5 conv layers (1->16->32->ResBlock->64->ResBlock->128) -> 512 feats.
+    Local branch : 4 conv layers (1->16->32->ResBlock->64)               -> 256 feats.
+    BatchNorm on the deeper layers stabilises training; skip connections ease optimisation.
+    """
+    import torch
     import torch.nn as nn
 
-    def branch(out_len):
+    class ResBlock1d(nn.Module):
+        """Conv-BN-ReLU-Conv-BN + skip (identity) connection."""
+        def __init__(self, ch, k=5):
+            super().__init__()
+            self.conv1 = nn.Conv1d(ch, ch, k, padding=k // 2)
+            self.bn1 = nn.BatchNorm1d(ch)
+            self.conv2 = nn.Conv1d(ch, ch, k, padding=k // 2)
+            self.bn2 = nn.BatchNorm1d(ch)
+            self.relu = nn.ReLU(inplace=True)
+
+        def forward(self, x):
+            r = self.relu(self.bn1(self.conv1(x)))
+            return self.relu(self.bn2(self.conv2(r)) + x)
+
+    def global_branch():
         return nn.Sequential(
             nn.Conv1d(1, 16, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(16, 32, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, 5, padding=2), nn.ReLU(), nn.AdaptiveMaxPool1d(out_len),
-            nn.Flatten())
+            nn.Conv1d(16, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+            ResBlock1d(32),
+            nn.Conv1d(32, 64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
+            ResBlock1d(64),
+            nn.Conv1d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveMaxPool1d(4), nn.Flatten())          # -> 128*4 = 512
+
+    def local_branch():
+        return nn.Sequential(
+            nn.Conv1d(1, 16, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+            ResBlock1d(32),
+            nn.Conv1d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveMaxPool1d(4), nn.Flatten())          # -> 64*4 = 256
 
     class DualViewCNN(nn.Module):
         def __init__(self):
             super().__init__()
-            self.g = branch(4)
-            self.l = branch(4)
-            feat = 64 * 4 + 64 * 4
+            self.g = global_branch()
+            self.l = local_branch()
+            feat = 128 * 4 + 64 * 4                          # 512 + 256 = 768
             self.head = nn.Sequential(
-                nn.Linear(feat, 128), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(feat, 256), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
                 nn.Linear(128, n_classes))
 
         def forward(self, xg, xl):
-            import torch
             return self.head(torch.cat([self.g(xg), self.l(xl)], dim=1))
 
     return DualViewCNN()
 
 
-def _augment_batch(xg, xl, rng, noise=0.02, max_roll=8, depth_jitter=0.1):
+def _augment_batch(xg, xl, rng, noise=0.02, max_roll=8, depth_jitter=0.1,
+                   mirror_prob=0.5):
     """On-the-fly augmentation for the dual views (combats small-data overfitting):
-    random phase-roll of the global view, Gaussian noise, and depth (amplitude) jitter.
+    random phase-roll, phase mirroring, Gaussian noise, and depth (amplitude) jitter.
     ``xg``/``xl`` are (B,1,L) torch tensors. Returns new augmented tensors."""
     import torch
-    B = xg.shape[0]
     # phase-roll the (periodic) global view
     shift = int(rng.integers(-max_roll, max_roll + 1))
     xg = torch.roll(xg, shifts=shift, dims=-1)
+    # phase mirroring: horizontal flip of both views (Schanche+2020 — removing it cost
+    # 3.1 AP points). Transit/EB shapes are time-symmetric, so a flip is a valid sample.
+    if rng.random() < mirror_prob:
+        xg = torch.flip(xg, dims=[-1])
+        xl = torch.flip(xl, dims=[-1])
     # depth/amplitude jitter (both views scaled together)
     scale = float(rng.uniform(1 - depth_jitter, 1 + depth_jitter))
     xg = xg * scale
@@ -239,6 +277,8 @@ def train_cnn(Xg, Xl, y, n_epochs=60, batch_size=32, lr=1e-3, test_size=0.25,
         tot = 0.0
         for s in range(0, n, batch_size):
             b = perm[s:s + batch_size]
+            if len(b) < 2:                     # BatchNorm needs >=2 samples in train mode
+                continue
             xg_b, xl_b = Xg_tr_t[b], Xl_tr_t[b]
             if augment:
                 xg_b, xl_b = _augment_batch(xg_b, xl_b, rng)
@@ -279,9 +319,98 @@ def load_cnn(path=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     classes = ckpt["classes"]
     model = _build_model(len(classes))
-    model.load_state_dict(ckpt["state_dict"])
+    try:
+        model.load_state_dict(ckpt["state_dict"])
+    except RuntimeError:
+        # architecture changed since this checkpoint was saved -> signal "no model"
+        print(f"[cnn] {path.name}: architecture mismatch (old checkpoint); retrain the CNN.")
+        return None, None
     model.eval()
     return model, classes
+
+
+def save_cnn_fold(model, classes, fold_idx):
+    """Save one k-fold CNN model to ``cnn_fold_{i}.pt`` for inference-time bagging."""
+    import torch
+    path = Path(CNN_FOLD_PATH_TEMPLATE.format(i=fold_idx))
+    torch.save({"state_dict": model.state_dict(), "classes": classes}, path)
+    return path
+
+
+def load_cnn_folds():
+    """Load all saved k-fold CNN models. Returns list of (model, classes); empty if none."""
+    models = []
+    for i in range(10):
+        p = Path(CNN_FOLD_PATH_TEMPLATE.format(i=i))
+        if not p.exists():
+            break
+        m, classes = load_cnn(path=p)
+        if m is not None:
+            models.append((m, classes))
+    return models
+
+
+def train_cnn_cv(Xg, Xl, y, n_splits=5, n_epochs=200, batch_size=32, lr=1e-3,
+                 random_state=42, augment=True, verbose=True):
+    """k-fold CNN training (Schanche+2020 bagging). Saves each fold to ``cnn_fold_{i}.pt``
+    so :func:`predict_cnn` / :func:`predict_ensemble` can average them at inference.
+
+    Returns a list of per-fold info dicts."""
+    import torch
+    import torch.nn as nn
+    from sklearn.model_selection import StratifiedKFold
+
+    classes = sorted(np.unique(y).tolist())
+    cls_idx = {c: i for i, c in enumerate(classes)}
+    yi = np.array([cls_idx[v] for v in y])
+
+    def _t(a):
+        return torch.tensor(a, dtype=torch.float32).unsqueeze(1)
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    fold_results = []
+    for fold, (tr, _te) in enumerate(skf.split(Xg, yi)):
+        if verbose:
+            print(f"[cnn] fold {fold + 1}/{n_splits} ({len(tr)} train)")
+        Xg_tr_t, Xl_tr_t = _t(Xg[tr]), _t(Xl[tr])
+        y_tr_t = torch.tensor(yi[tr], dtype=torch.long)
+        counts = np.bincount(yi[tr], minlength=len(classes)).astype(float)
+        w = torch.tensor(counts.sum() / np.maximum(counts, 1), dtype=torch.float32)
+        model = _build_model(len(classes))
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+        loss_fn = nn.CrossEntropyLoss(weight=w)
+        rng = np.random.default_rng(random_state + fold)
+        n = Xg_tr_t.shape[0]
+        for ep in range(n_epochs):
+            model.train()
+            perm = rng.permutation(n)
+            for s in range(0, n, batch_size):
+                b = perm[s:s + batch_size]
+                if len(b) < 2:                 # BatchNorm needs >=2 samples in train mode
+                    continue
+                xg_b, xl_b = Xg_tr_t[b], Xl_tr_t[b]
+                if augment:
+                    xg_b, xl_b = _augment_batch(xg_b, xl_b, rng)
+                opt.zero_grad()
+                loss_fn(model(xg_b, xl_b), y_tr_t[b]).backward()
+                opt.step()
+            if verbose and (ep + 1) % 50 == 0:
+                print(f"  epoch {ep + 1}/{n_epochs}")
+        save_cnn_fold(model, classes, fold)
+        fold_results.append({"fold": fold, "n_train": int(len(tr))})
+    return fold_results
+
+
+def _cnn_tta_proba(model, gv, xl_t, n_tta=8):
+    """Average softmax probabilities over ``n_tta`` phase-rolls of the global view."""
+    import torch
+    rolls = [0] if n_tta <= 1 else np.linspace(0, len(gv), n_tta, endpoint=False).astype(int)
+    probs = []
+    with torch.no_grad():
+        for r in rolls:
+            xg = torch.tensor(np.roll(gv, r), dtype=torch.float32).view(1, 1, -1)
+            probs.append(torch.softmax(model(xg, xl_t), dim=1).numpy()[0])
+    return np.mean(probs, axis=0)
 
 
 # --------------------------------------------------------------------------------------
@@ -290,23 +419,25 @@ def load_cnn(path=None):
 def predict_cnn(global_view, local_view, model=None, classes=None, n_tta=8):
     """Return (class, confidence) from the CNN for one pair of views.
 
-    ``n_tta`` > 1 enables test-time augmentation: the global view is phase-rolled
-    ``n_tta`` times and probabilities are averaged, giving more robust predictions.
+    Uses k-fold **bagging** (all ``cnn_fold_*.pt`` models) when available, each with
+    ``n_tta`` phase-roll test-time augmentations averaged; else the single model.
     """
     import torch
+    gv = np.asarray(global_view, dtype="float32")
+    xl = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
+
     if model is None:
+        folds = load_cnn_folds()
+        if folds:
+            probs = [_cnn_tta_proba(m, gv, xl, n_tta) for (m, _c) in folds]
+            p = np.mean(probs, axis=0)
+            classes = folds[0][1]
+            i = int(p.argmax())
+            return classes[i], float(p[i])
         model, classes = load_cnn()
     if model is None:
         raise RuntimeError("No trained CNN found; train it first.")
-    gv = np.asarray(global_view, dtype="float32")
-    xl = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
-    rolls = [0] if n_tta <= 1 else np.linspace(0, len(gv), n_tta, endpoint=False).astype(int)
-    probs = []
-    with torch.no_grad():
-        for r in rolls:
-            xg = torch.tensor(np.roll(gv, r), dtype=torch.float32).view(1, 1, -1)
-            probs.append(torch.softmax(model(xg, xl), dim=1).numpy()[0])
-    p = np.mean(probs, axis=0)
+    p = _cnn_tta_proba(model, gv, xl, n_tta)
     i = int(p.argmax())
     return classes[i], float(p[i])
 
@@ -319,34 +450,45 @@ def predict_ensemble(features, global_view, local_view,
     """
     from . import classify
 
-    # tabular probabilities
-    if tab_model is None:
-        tab_model = classify.load_model()
+    x = np.nan_to_num(
+        np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]], float),
+        nan=-99.0)
+
+    # tabular probabilities (bagged across k folds when available, else single model)
     tab_p = None
-    if tab_model is not None:
+    if tab_model is None:
+        fold_models = classify.load_fold_models()
+        if fold_models:
+            try:
+                cls, proba = classify._bagged_proba(fold_models, x)
+                tab_p = dict(zip(cls, proba))
+            except Exception:
+                tab_p = None
+        if tab_p is None:
+            tab_model = classify.load_model()
+    if tab_p is None and tab_model is not None:
         try:
-            x = np.nan_to_num(
-                np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]], float),
-                nan=-99.0)
             tab_p = dict(zip(list(tab_model.classes_), tab_model.predict_proba(x)[0]))
         except Exception:
             tab_p = None        # stale model (feature-count mismatch) -> skip tabular
 
-    # cnn probabilities (with TTA: 8 phase rolls averaged)
+    # cnn probabilities (bagged across k folds when available; each with TTA)
     cnn_p = None
     if cnn_model is None:
-        cnn_model, cnn_classes = load_cnn()
-    if cnn_model is not None:
+        folds = load_cnn_folds()
+        if folds:
+            import torch
+            gv = np.asarray(global_view, dtype="float32")
+            xl_t = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
+            probs = [_cnn_tta_proba(m, gv, xl_t, 8) for (m, _c) in folds]
+            cnn_p = dict(zip(folds[0][1], np.mean(probs, axis=0)))
+        else:
+            cnn_model, cnn_classes = load_cnn()
+    if cnn_p is None and cnn_model is not None:
         import torch
         gv = np.asarray(global_view, dtype="float32")
         xl_t = torch.tensor(local_view, dtype=torch.float32).view(1, 1, -1)
-        rolls = np.linspace(0, len(gv), 8, endpoint=False).astype(int)
-        probs = []
-        with torch.no_grad():
-            for r in rolls:
-                xg = torch.tensor(np.roll(gv, r), dtype=torch.float32).view(1, 1, -1)
-                probs.append(torch.softmax(cnn_model(xg, xl_t), dim=1).numpy()[0])
-        cnn_p = dict(zip(cnn_classes, np.mean(probs, axis=0)))
+        cnn_p = dict(zip(cnn_classes, _cnn_tta_proba(cnn_model, gv, xl_t, 8)))
 
     if tab_p is None and cnn_p is None:
         return classify.predict(features)

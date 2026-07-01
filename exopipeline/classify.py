@@ -118,12 +118,18 @@ def train(df: pd.DataFrame, calibrate=True, test_size=0.25, random_state=42,
                 report=report, confusion_matrix=cm, pr_auc=pr_auc)
 
 
-def cross_validate(df: pd.DataFrame, n_splits=5, params=None, random_state=42):
+def cross_validate(df: pd.DataFrame, n_splits=5, params=None, random_state=42,
+                   save_fold_models=False):
     """Stratified k-fold CV macro-F1 for the tabular model (the honest headline metric).
 
-    Returns dict(mean, std, per_fold, oof_pred, oof_true).
+    When ``save_fold_models=True``, each fold's fitted ``LGBMClassifier`` is saved to
+    ``data/features/classifier_fold_{i}.joblib`` so :func:`predict` can *bag* them at
+    inference (averaging probabilities across folds reduces variance; Schanche+2020).
+
+    Returns dict(mean, std, per_fold, oof_pred, oof_true, fold_models).
     """
     import lightgbm as lgb
+    import joblib
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import f1_score
 
@@ -131,26 +137,29 @@ def cross_validate(df: pd.DataFrame, n_splits=5, params=None, random_state=42):
     y = df["label"].values
     params = params or dict(n_estimators=400, learning_rate=0.05, num_leaves=31)
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    scores, oof_p, oof_t = [], [], []
-    for tr, te in skf.split(X, y):
+    scores, oof_p, oof_t, fold_models = [], [], [], []
+    for i, (tr, te) in enumerate(skf.split(X, y)):
         m = lgb.LGBMClassifier(objective="multiclass", class_weight="balanced",
                                random_state=random_state, verbose=-1, **params)
         m.fit(X[tr], y[tr])
         p = m.predict(X[te])
         scores.append(f1_score(y[te], p, average="macro"))
         oof_p.extend(p.tolist()); oof_t.extend(y[te].tolist())
+        fold_models.append(m)
+        if save_fold_models:
+            joblib.dump(m, config.MODEL_PATH.parent / f"classifier_fold_{i}.joblib")
     return dict(mean=float(np.mean(scores)), std=float(np.std(scores)),
-                per_fold=scores, oof_pred=oof_p, oof_true=oof_t)
+                per_fold=scores, oof_pred=oof_p, oof_true=oof_t, fold_models=fold_models)
 
 
 def tune_lightgbm(df: pd.DataFrame, n_splits=4, random_state=42, verbose=True):
     """Small grid search on CV macro-F1. Returns (best_params, best_score, all_results)."""
     from itertools import product
     grid = dict(
-        num_leaves=[15, 31, 63],
-        n_estimators=[300, 600],
-        learning_rate=[0.03, 0.05, 0.1],
-        min_child_samples=[5, 20],
+        num_leaves=[15, 31, 63, 127],
+        n_estimators=[600, 1000],
+        learning_rate=[0.03, 0.05],
+        min_child_samples=[3, 5, 20],
     )
     keys = list(grid)
     best, best_score, results = None, -1.0, []
@@ -180,21 +189,61 @@ def load_model(path=None):
     return joblib.load(path)
 
 
+def load_fold_models():
+    """Load all saved k-fold LightGBM models (``classifier_fold_{i}.joblib``).
+
+    Returns a list (empty if no fold models exist -> caller uses the single model)."""
+    import joblib
+    models = []
+    base = config.MODEL_PATH.parent
+    for i in range(10):
+        p = base / f"classifier_fold_{i}.joblib"
+        if p.exists():
+            models.append(joblib.load(p))
+        else:
+            break
+    return models
+
+
+def _bagged_proba(fold_models, x):
+    """Average predicted probabilities across fold models onto a shared class axis."""
+    all_classes = sorted(set().union(*[set(m.classes_) for m in fold_models]))
+    proba = np.zeros(len(all_classes))
+    for m in fold_models:
+        p = m.predict_proba(x)[0]
+        for j, cls in enumerate(m.classes_):
+            proba[all_classes.index(cls)] += p[j]
+    proba /= len(fold_models)
+    return all_classes, proba
+
+
 # --------------------------------------------------------------------------------------
 # Prediction (with heuristic fallback)
 # --------------------------------------------------------------------------------------
 def predict(features: dict, model=None) -> tuple[str, float]:
     """Return (class, calibrated_confidence). Falls back to the rule-based heuristic if no
-    trained model is available."""
+    trained model is available.
+
+    If k-fold models exist (``classifier_fold_*.joblib``) they are *bagged* — probabilities
+    averaged across folds — which reduces variance; otherwise the single calibrated model is
+    used (backward compatible)."""
+    x = np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]], dtype=float)
+    x = np.nan_to_num(x, nan=-99.0)
+
     if model is None:
+        fold_models = load_fold_models()
+        if fold_models:
+            try:
+                classes, proba = _bagged_proba(fold_models, x)
+                i = int(np.argmax(proba))
+                return classes[i], float(proba[i])
+            except Exception:
+                pass                         # stale fold models -> fall through to single/heuristic
         model = load_model()
     if model is None:
         return verdict_heuristic(features)
 
     try:
-        x = np.array([[features.get(c, np.nan) for c in config.FEATURE_COLUMNS]],
-                     dtype=float)
-        x = np.nan_to_num(x, nan=-99.0)
         proba = model.predict_proba(x)[0]
     except Exception:
         return verdict_heuristic(features)   # stale model (feature mismatch) -> heuristic
