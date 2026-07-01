@@ -102,12 +102,31 @@ def build_training_set(sample: pd.DataFrame, feat_path=None, view_path=None,
         ingest.prefetch_targets(todo["tic"].tolist(), max_sectors=4, verbose=verbose)
 
     def _save():
+        """Write the checkpoint, retrying on transient filesystem errors (e.g. an
+        external/secondary drive briefly dropping out) instead of crashing the whole
+        build. ``feat_rows``/``views_g``/``views_l`` keep accumulating in memory across
+        calls, so a skipped checkpoint just means the next one carries everything again.
+        """
+        import time as _t
+
         df = pd.DataFrame([{k: v for k, v in r.items()} for r in feat_rows])
-        df.to_parquet(feat_path, index=False)
-        np.savez_compressed(view_path,
-                            Xg=np.array(views_g, "float32"),
-                            Xl=np.array(views_l, "float32"),
-                            y=df["label"].values, tics=df["target"].values)
+        last_err = None
+        for attempt in range(5):
+            try:
+                feat_path.parent.mkdir(parents=True, exist_ok=True)
+                df.to_parquet(feat_path, index=False)
+                np.savez_compressed(view_path,
+                                    Xg=np.array(views_g, "float32"),
+                                    Xl=np.array(views_l, "float32"),
+                                    y=df["label"].values, tics=df["target"].values)
+                return
+            except OSError as e:
+                last_err = e
+                print(f"[featurize] checkpoint write failed (attempt {attempt+1}/5): "
+                     f"{e}; retrying...")
+                _t.sleep(5 * (attempt + 1))
+        print(f"[featurize] checkpoint SKIPPED after 5 retries ({last_err}); "
+             f"will retry at the next checkpoint interval.")
 
     t0, n_new = _time.time(), 0
     with ProcessPoolExecutor(max_workers=n_workers) as pool:

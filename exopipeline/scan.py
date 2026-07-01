@@ -264,14 +264,34 @@ def scan_slice(sector: int | None = None, n: int | None = None,
 
 
 def _checkpoint(new_rows: list[dict], out_csv):
-    """Append new rows to the candidate CSV (merging with any existing, dedup on tid)."""
+    """Append new rows to the candidate CSV (merging with any existing, dedup on tid).
+
+    Retries with backoff on transient filesystem errors (e.g. an external/secondary drive
+    that briefly drops out) instead of letting one bad write kill an hours-long scan. If the
+    drive is still gone after all retries, the in-memory ``results`` accumulated so far in
+    :func:`scan_slice` are NOT lost -- only this checkpoint is skipped; the next successful
+    checkpoint will include everything.
+    """
+    import time as _t
+
     df_new = pd.DataFrame(new_rows)
-    if out_csv.exists():
-        df = pd.concat([pd.read_csv(out_csv), df_new], ignore_index=True)
-        df = df.drop_duplicates(subset="tid", keep="last")
-    else:
-        df = df_new
-    df.to_csv(out_csv, index=False)
+    last_err = None
+    for attempt in range(5):
+        try:
+            out_csv.parent.mkdir(parents=True, exist_ok=True)   # recreate if the drive blipped
+            if out_csv.exists():
+                df = pd.concat([pd.read_csv(out_csv), df_new], ignore_index=True)
+                df = df.drop_duplicates(subset="tid", keep="last")
+            else:
+                df = df_new
+            df.to_csv(out_csv, index=False)
+            return
+        except OSError as e:
+            last_err = e
+            print(f"[scan] checkpoint write failed (attempt {attempt+1}/5): {e}; retrying...")
+            _t.sleep(5 * (attempt + 1))
+    print(f"[scan] checkpoint SKIPPED after 5 retries ({last_err}); "
+          f"{len(new_rows)} rows will be re-included in the next checkpoint.")
 
 
 # --------------------------------------------------------------------------------------
