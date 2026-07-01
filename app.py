@@ -111,8 +111,9 @@ with st.sidebar:
     run_btn = st.button("🚀 Run pipeline", type="primary", use_container_width=True)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load(target, max_sectors):
+    # cache_resource (not cache_data): Star holds an unpicklable lightkurve object
     return ingest.clean(ingest.load_star(target, max_sectors=max_sectors))
 
 
