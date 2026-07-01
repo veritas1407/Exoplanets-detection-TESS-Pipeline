@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -295,6 +296,134 @@ def load_lc_from_url(url: str, lc_file: str | None = None,
             except Exception:
                 pass
     return star
+
+
+# --------------------------------------------------------------------------------------
+# Fast concurrent prefetch — the download bottleneck fix
+# --------------------------------------------------------------------------------------
+# The CPU-bound stages (scan.scan_slice, featurize.build_training_set) download+process
+# each target inside a ProcessPoolExecutor capped at ~cpu_count workers. That's correct
+# for the CPU-bound BLS search, but it also caps *network* concurrency at cpu_count -- a
+# waste, since a download is blocked on network I/O (which releases the GIL) and MAST's
+# S3-backed archive comfortably serves 20-30+ concurrent connections. Fix: prefetch the
+# whole batch with a much larger ThreadPoolExecutor *before* the CPU stage starts, so
+# CPU workers hit an already-warm on-disk cache and never wait on the network.
+def _download_only(session, url: str, lc_file: str | None = None, timeout: int = 180):
+    """Fetch one FITS URL to ``data/cache/`` if not already cached (bytes only, no parse).
+    Returns ``(lc_file, ok, error)``."""
+    import re
+    if lc_file is None:
+        m = re.search(r"([^/=:]+\.fits)", url)
+        lc_file = m.group(1) if m else "lc.fits"
+    dest = config.CACHE_DIR / lc_file
+    if dest.exists():
+        return lc_file, True, ""
+    try:
+        resp = session.get(url, timeout=timeout, headers={"User-Agent": "exopipeline/1.0"})
+        resp.raise_for_status()
+        dest.write_bytes(resp.content)
+        return lc_file, True, ""
+    except Exception as e:
+        return lc_file, False, f"{type(e).__name__}: {e}"
+
+
+def prefetch_urls(rows, n_workers: int | None = None, verbose: bool = True):
+    """Concurrently pre-download known FITS URLs into ``data/cache/`` (I/O-bound).
+
+    ``rows`` is a list of dicts with ``url`` (+ optional ``lc_file``) -- the sector
+    manifest schema used by :func:`exopipeline.scan.scan_slice`. Call this *before* the
+    ProcessPoolExecutor CPU stage so workers skip the network entirely. Uses a shared
+    ``requests.Session`` with a large connection pool + retry/backoff for transient
+    MAST hiccups. Returns ``(n_ok, n_fail)``.
+    """
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    n_workers = n_workers or min(config.PREFETCH_WORKERS, max(1, len(rows)))
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=n_workers, pool_maxsize=n_workers, max_retries=retry)
+    session.mount("https://", adapter); session.mount("http://", adapter)
+
+    t0, n_ok, n_fail = _t.time(), 0, 0
+    if verbose:
+        print(f"[prefetch] {len(rows)} FITS to fetch, {n_workers} threads")
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futs = [pool.submit(_download_only, session, r["url"], r.get("lc_file")) for r in rows]
+        for i, fut in enumerate(as_completed(futs), 1):
+            _lc_file, ok, _err = fut.result()
+            n_ok += ok; n_fail += (not ok)
+            if verbose and i % 100 == 0:
+                rate = i / max(_t.time() - t0, 1e-9)
+                print(f"  [prefetch] {i}/{len(rows)} ({rate:.1f}/s) ok={n_ok} failed={n_fail}")
+    if verbose:
+        print(f"[prefetch] done: {n_ok} cached, {n_fail} failed, {(_t.time()-t0)/60:.1f} min")
+    return n_ok, n_fail
+
+
+def _prefetch_one_target(tic, max_sectors):
+    """Warm the FITS cache for one TIC via lightkurve's search+download (no BLS/feature
+    work here -- this only fills ``data/cache`` so the later CPU stage hits it)."""
+    import lightkurve as lk
+    try:
+        search = lk.search_lightcurve(tic, author="SPOC", cadence="short")
+        if len(search) == 0:
+            return tic, False, "no SPOC 2-min light curves"
+        if max_sectors is not None:
+            search = search[:max_sectors]
+        search.download_all(quality_bitmask="default", download_dir=str(config.CACHE_DIR))
+        return tic, True, ""
+    except Exception as e:
+        return tic, False, f"{type(e).__name__}: {e}"
+
+
+def prefetch_targets(tics, max_sectors: int = 4, n_workers: int | None = None,
+                     verbose: bool = True):
+    """Concurrently warm the FITS cache for a batch of TICs (no known direct URL, so this
+    threads lightkurve's own search+download -- still I/O-bound, still scales past
+    cpu_count). Use before :func:`exopipeline.featurize.build_training_set`'s CPU stage.
+    Returns ``(n_ok, n_fail)``.
+    """
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    n_workers = n_workers or min(config.PREFETCH_WORKERS, max(1, len(tics)))
+    t0, n_ok, n_fail = _t.time(), 0, 0
+    if verbose:
+        print(f"[prefetch] {len(tics)} targets to warm, {n_workers} threads")
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futs = [pool.submit(_prefetch_one_target, tic, max_sectors) for tic in tics]
+        for i, fut in enumerate(as_completed(futs), 1):
+            _tic, ok, _err = fut.result()
+            n_ok += ok; n_fail += (not ok)
+            if verbose and i % 25 == 0:
+                rate = i / max(_t.time() - t0, 1e-9)
+                print(f"  [prefetch] {i}/{len(tics)} ({rate:.2f}/s) ok={n_ok} failed={n_fail}")
+    if verbose:
+        print(f"[prefetch] done: {n_ok} cached, {n_fail} failed, {(_t.time()-t0)/60:.1f} min")
+    return n_ok, n_fail
+
+
+def write_aria2_input(manifest_df, path=None):
+    """Write an aria2c input file (URL + ``out=`` filename per pair) for a whole sector.
+
+    For power users with ``aria2c`` installed: segmented, massively parallel downloads
+    are faster than any pure-Python thread pool for a full ~20k-target sector mirror.
+    Not required by the rest of the pipeline -- an optional, even-faster external path::
+
+        ingest.write_aria2_input(scan.build_slice(sector=5), "sector5.aria2.txt")
+        # then, in a shell:
+        #   aria2c -i sector5.aria2.txt -d data/cache -x4 -j32 -c
+        # (-x4: 4 connections/file, -j32: 32 files at once, -c: resume partial files)
+    """
+    path = Path(path or (config.CACHE_DIR / "aria2_input.txt"))
+    with open(path, "w") as f:
+        for _, r in manifest_df.iterrows():
+            f.write(f"{r['url']}\n  out={r['lc_file']}\n")
+    return path
 
 
 _STELLAR_CACHE: dict = {}

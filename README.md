@@ -197,6 +197,19 @@ small-data result: ensemble-of-specialists beats end-to-end joint fusion until t
 set is much larger. The experiment (`cnn._build_model_fused` / `cnn.train_cnn_fused`) is
 kept in the codebase as a documented, tested negative result rather than deleted.
 
+### Fast concurrent download prefetch (`ingest.prefetch_urls` / `prefetch_targets`)
+The scan/build stages (`scan.scan_slice`, `featurize.build_training_set`) run a
+`ProcessPoolExecutor` at `~cpu_count` workers for the **CPU-bound** BLS search — correct
+for that stage, but it also silently capped network concurrency at the same worker count,
+since downloads happened inside the same per-target worker call. A download is I/O-bound
+(blocked on network round-trip, which releases the GIL) and MAST's S3-backed archive
+comfortably serves 20-30+ concurrent connections — so a `ThreadPoolExecutor` prefetch pass
+now warms `data/cache/` *before* the CPU stage starts, decoupling network concurrency from
+core count entirely. Measured on 16 fresh Sector 6 FITS files: **sequential 4.21 s/file →
+24-thread concurrent 0.22 s/file (≈19×)**, zero failures. For a one-off full-sector mirror,
+`ingest.write_aria2_input()` writes an `aria2c` input file for an even more aggressive
+external, segmented, massively-parallel download (`aria2c -i sector.txt -x4 -j32 -c`).
+
 ### Explainable inference (`predict.py`)
 `predict.predict_lightcurve / predict_fits / predict_target / predict_batch` are the single
 entrypoint for an unknown test set: a raw light curve → detect → classify → significance →

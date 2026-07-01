@@ -95,6 +95,12 @@ def build_training_set(sample: pd.DataFrame, feat_path=None, view_path=None,
     if verbose:
         print(f"[featurize] {len(sample)} targets, {len(rows)} to build, {n_workers} workers")
 
+    # Prefetch: warm data/cache/ with a large I/O-bound thread pool BEFORE the CPU-bound
+    # BLS stage starts, so the ProcessPoolExecutor below hits an already-cached FITS per
+    # target instead of each worker separately serializing a MAST search+download.
+    if rows:
+        ingest.prefetch_targets(todo["tic"].tolist(), max_sectors=4, verbose=verbose)
+
     def _save():
         df = pd.DataFrame([{k: v for k, v in r.items()} for r in feat_rows])
         df.to_parquet(feat_path, index=False)

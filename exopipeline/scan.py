@@ -226,6 +226,12 @@ def scan_slice(sector: int | None = None, n: int | None = None,
         print(f"[scan] sector {sector}: {len(targets)} in slice, "
               f"{len(rows)} to process this run ({mode})")
 
+    # Prefetch: warm data/cache/ with a large I/O-bound thread pool BEFORE the CPU-bound
+    # BLS stage starts. Downloads no longer share the cpu_count-limited process pool, so
+    # network concurrency scales independently of core count (config.PREFETCH_WORKERS).
+    if rows and use_processes and n_workers > 1:
+        ingest.prefetch_urls(rows, verbose=verbose)
+
     results, t_start, ck = [], _time.time(), config.SCAN_CHECKPOINT_EVERY
     done_count = 0
 

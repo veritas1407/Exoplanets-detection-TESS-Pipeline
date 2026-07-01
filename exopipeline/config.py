@@ -42,6 +42,8 @@ SCAN_PERIOD_MAX_FRAC = 0.5        # period_max = this * light-curve baseline (da
 SCAN_PERIOD_MAX_CAP = 13.0        # never search longer than this in a single-sector scan
 SCAN_N_PERIODS = 12000            # BLS grid points for the (smaller) single-sector range
 SCAN_WORKERS = 0                  # 0 = use (cpu_count - 1) processes; >=1 sets it explicitly
+PREFETCH_WORKERS = 24             # I/O-bound download threads (network waits release the
+                                   # GIL, so this can far exceed cpu_count -- see ingest.py)
 SECTOR_CANDIDATES_CSV = FEATURES_DIR / "sector_{sector}_candidates.csv"
 SECTOR_MANIFEST = LABELS_DIR / "sector_{sector}_manifest.parquet"
 
