@@ -442,11 +442,13 @@ def predict_cnn(global_view, local_view, model=None, classes=None, n_tta=8):
     return classes[i], float(p[i])
 
 
-def predict_ensemble(features, global_view, local_view,
-                     tab_model=None, cnn_model=None, cnn_classes=None, w_cnn=0.5):
-    """Late-fusion of the tabular LightGBM and the dual-view CNN (averaged probabilities).
+def ensemble_proba(features, global_view, local_view,
+                   tab_model=None, cnn_model=None, cnn_classes=None, w_cnn=0.5):
+    """Late-fusion probabilities of the tabular LightGBM and the dual-view CNN.
 
-    Returns (class, confidence). Falls back gracefully to whichever model is available.
+    Returns ``(fused, tab_p, cnn_p)`` where each is a ``{class: prob}`` dict (``tab_p`` /
+    ``cnn_p`` may be ``None`` if that track is unavailable). ``fused`` is ``None`` only when
+    *both* tracks are unavailable. Uses k-fold bagging + TTA where models exist.
     """
     from . import classify
 
@@ -491,14 +493,28 @@ def predict_ensemble(features, global_view, local_view,
         cnn_p = dict(zip(cnn_classes, _cnn_tta_proba(cnn_model, gv, xl_t, 8)))
 
     if tab_p is None and cnn_p is None:
-        return classify.predict(features)
+        return None, None, None
     if cnn_p is None:
-        i = max(tab_p, key=tab_p.get); return i, float(tab_p[i])
+        return dict(tab_p), tab_p, None
     if tab_p is None:
-        i = max(cnn_p, key=cnn_p.get); return i, float(cnn_p[i])
+        return dict(cnn_p), None, cnn_p
 
     classes = sorted(set(tab_p) | set(cnn_p))
-    fused = {c: (1 - w_cnn) * tab_p.get(c, 0.0) + w_cnn * cnn_p.get(c, 0.0)
+    fused = {c: float((1 - w_cnn) * tab_p.get(c, 0.0) + w_cnn * cnn_p.get(c, 0.0))
              for c in classes}
+    return fused, tab_p, cnn_p
+
+
+def predict_ensemble(features, global_view, local_view,
+                     tab_model=None, cnn_model=None, cnn_classes=None, w_cnn=0.5):
+    """Late-fusion of the tabular LightGBM and the dual-view CNN (averaged probabilities).
+
+    Returns (class, confidence). Falls back gracefully to whichever model is available.
+    """
+    from . import classify
+    fused, _tab, _cnn = ensemble_proba(features, global_view, local_view,
+                                       tab_model, cnn_model, cnn_classes, w_cnn)
+    if fused is None:
+        return classify.predict(features)
     i = max(fused, key=fused.get)
     return i, float(fused[i])
