@@ -5,7 +5,28 @@ notebooks, and the Streamlit app share one source of truth.
 """
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
+
+# --------------------------------------------------------------------------------------
+# On a long unattended background run (multi-hour scans/builds), the captured stdout
+# stream has occasionally hit a transient "I/O operation on closed file" error -- it has
+# recurred at different, unrelated print() call sites across ingest.py/featurize.py, so
+# it's a property of the output stream itself (harness/OS-level pipe handling), not a
+# localized bug. Losing one progress line is harmless; crashing an hours-long compute job
+# over it is not. Patch the builtin so every print() everywhere (including in worker
+# processes, which re-import this module fresh under Windows spawn) is protected.
+_real_print = builtins.print
+
+
+def _safe_print(*args, **kwargs):
+    try:
+        _real_print(*args, **kwargs)
+    except (ValueError, OSError):
+        pass
+
+
+builtins.print = _safe_print
 
 # --------------------------------------------------------------------------------------
 # Paths

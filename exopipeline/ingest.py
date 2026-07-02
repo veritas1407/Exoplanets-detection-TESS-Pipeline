@@ -298,6 +298,18 @@ def load_lc_from_url(url: str, lc_file: str | None = None,
     return star
 
 
+def _safe_print(msg: str):
+    """print() that swallows a closed/broken stdout instead of crashing the whole run.
+
+    On a long background job the harness's captured output stream can occasionally hit a
+    transient I/O error (e.g. ``ValueError: I/O operation on closed file``); losing one
+    progress line is fine, losing hours of unattended compute to it is not."""
+    try:
+        print(msg)
+    except (ValueError, OSError):
+        pass
+
+
 # --------------------------------------------------------------------------------------
 # Fast concurrent prefetch — the download bottleneck fix
 # --------------------------------------------------------------------------------------
@@ -350,7 +362,7 @@ def prefetch_urls(rows, n_workers: int | None = None, verbose: bool = True):
 
     t0, n_ok, n_fail = _t.time(), 0, 0
     if verbose:
-        print(f"[prefetch] {len(rows)} FITS to fetch, {n_workers} threads")
+        _safe_print(f"[prefetch] {len(rows)} FITS to fetch, {n_workers} threads")
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futs = [pool.submit(_download_only, session, r["url"], r.get("lc_file")) for r in rows]
         for i, fut in enumerate(as_completed(futs), 1):
@@ -358,15 +370,21 @@ def prefetch_urls(rows, n_workers: int | None = None, verbose: bool = True):
             n_ok += ok; n_fail += (not ok)
             if verbose and i % 100 == 0:
                 rate = i / max(_t.time() - t0, 1e-9)
-                print(f"  [prefetch] {i}/{len(rows)} ({rate:.1f}/s) ok={n_ok} failed={n_fail}")
+                _safe_print(f"  [prefetch] {i}/{len(rows)} ({rate:.1f}/s) ok={n_ok} failed={n_fail}")
     if verbose:
-        print(f"[prefetch] done: {n_ok} cached, {n_fail} failed, {(_t.time()-t0)/60:.1f} min")
+        _safe_print(f"[prefetch] done: {n_ok} cached, {n_fail} failed, {(_t.time()-t0)/60:.1f} min")
     return n_ok, n_fail
 
 
 def _prefetch_one_target(tic, max_sectors):
     """Warm the FITS cache for one TIC via lightkurve's search+download (no BLS/feature
-    work here -- this only fills ``data/cache`` so the later CPU stage hits it)."""
+    work here -- this only fills ``data/cache`` so the later CPU stage hits it).
+
+    ``verbose=False`` passes through to astroquery's ``download_products`` and suppresses
+    its per-file "Downloading URL ... [Done]" print -- important here because this runs
+    inside a many-thread pool, where `contextlib.redirect_stdout`-style stdout hijacking
+    would NOT be thread-safe (sys.stdout is process-global); a plain kwarg is.
+    """
     import lightkurve as lk
     try:
         search = lk.search_lightcurve(tic, author="SPOC", cadence="short")
@@ -374,7 +392,8 @@ def _prefetch_one_target(tic, max_sectors):
             return tic, False, "no SPOC 2-min light curves"
         if max_sectors is not None:
             search = search[:max_sectors]
-        search.download_all(quality_bitmask="default", download_dir=str(config.CACHE_DIR))
+        search.download_all(quality_bitmask="default", download_dir=str(config.CACHE_DIR),
+                            verbose=False)
         return tic, True, ""
     except Exception as e:
         return tic, False, f"{type(e).__name__}: {e}"
@@ -393,7 +412,7 @@ def prefetch_targets(tics, max_sectors: int = 4, n_workers: int | None = None,
     n_workers = n_workers or min(config.PREFETCH_WORKERS, max(1, len(tics)))
     t0, n_ok, n_fail = _t.time(), 0, 0
     if verbose:
-        print(f"[prefetch] {len(tics)} targets to warm, {n_workers} threads")
+        _safe_print(f"[prefetch] {len(tics)} targets to warm, {n_workers} threads")
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futs = [pool.submit(_prefetch_one_target, tic, max_sectors) for tic in tics]
         for i, fut in enumerate(as_completed(futs), 1):
@@ -401,9 +420,9 @@ def prefetch_targets(tics, max_sectors: int = 4, n_workers: int | None = None,
             n_ok += ok; n_fail += (not ok)
             if verbose and i % 25 == 0:
                 rate = i / max(_t.time() - t0, 1e-9)
-                print(f"  [prefetch] {i}/{len(tics)} ({rate:.2f}/s) ok={n_ok} failed={n_fail}")
+                _safe_print(f"  [prefetch] {i}/{len(tics)} ({rate:.2f}/s) ok={n_ok} failed={n_fail}")
     if verbose:
-        print(f"[prefetch] done: {n_ok} cached, {n_fail} failed, {(_t.time()-t0)/60:.1f} min")
+        _safe_print(f"[prefetch] done: {n_ok} cached, {n_fail} failed, {(_t.time()-t0)/60:.1f} min")
     return n_ok, n_fail
 
 
